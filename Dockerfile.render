@@ -1,0 +1,61 @@
+# =============================================================================
+# Dockerfile.render  --  ONE image for Render's FREE plan
+# -----------------------------------------------------------------------------
+# Docker Compose runs three containers (Postgres, API, nginx+frontend). Render's free plan only offers
+# Web Services, Postgres and Key Value, and a free web service cannot be reached privately by another
+# one, so the API and the frontend cannot live in separate services. This image therefore holds both:
+# the Express API serves the built React app itself (SERVE_FRONTEND=true, see backend/src/index.js).
+#
+# It does NOT replace backend/Dockerfile or frontend/Dockerfile (Docker Compose keeps using those).
+# The build context is the project root (render.yaml: dockerContext: .).
+#
+# Stages:
+#   1. frontend-build  - Vite production build of the React app
+#   2. backend-deps    - production-only node_modules (no dev tooling in the final image)
+#   3. runtime         - small final image: API + built frontend + pg_dump/psql, running as non-root
+# =============================================================================
+
+# ---- 1/3: frontend build ----------------------------------------------------
+# Debian-based (glibc) so npm's optional native build tools resolve without musl surprises.
+FROM node:22-slim AS frontend-build
+WORKDIR /build
+# Same-origin API: the browser calls /api on the page's own host (no CORS, no hard-coded URL).
+ARG VITE_API_URL=/api
+ENV VITE_API_URL=$VITE_API_URL
+# Lockfile first so this layer is cached until the dependencies change.
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --no-audit --no-fund --fetch-retries=5 --fetch-retry-mintimeout=2000
+COPY frontend/ ./
+RUN npm run build
+
+# ---- 2/3: backend production dependencies -----------------------------------
+FROM node:22-alpine AS backend-deps
+WORKDIR /app
+COPY backend/package.json backend/package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund && npm cache clean --force
+
+# ---- 3/3: runtime -----------------------------------------------------------
+FROM node:22-alpine
+ENV NODE_ENV=production \
+    SERVE_FRONTEND=true \
+    FRONTEND_DIR=/app/public \
+    BACKUP_DIR=/app/backups
+WORKDIR /app
+
+# pg_dump / psql for the in-app backup & restore. The client major version must be >= the server's:
+# Render Postgres is pinned to 16 in render.yaml, so keep this at 16 (a 15 client refuses a 16 server).
+RUN apk add --no-cache postgresql16-client
+
+COPY --from=backend-deps /app/node_modules ./node_modules
+COPY backend/package.json ./
+COPY backend/src ./src
+COPY --from=frontend-build /build/dist ./public
+COPY render-start.sh ./render-start.sh
+
+# Run as the unprivileged `node` user that ships with the image
+RUN mkdir -p /app/backups && chown -R node:node /app && chmod +x /app/render-start.sh
+USER node
+
+# Render injects PORT (10000 by default) and routes traffic to it; the app reads it.
+EXPOSE 10000
+CMD ["/app/render-start.sh"]

@@ -1,0 +1,77 @@
+# =============================================================================
+# render.yaml  --  Render Blueprint: the whole Inventory System on the FREE plan
+# -----------------------------------------------------------------------------
+# Spec: https://render.com/docs/blueprint-spec     Free plan: https://render.com/docs/free
+# Step-by-step guide and trade-offs: RENDER.md
+#
+# Two free resources:
+#   inventory-db   Render Postgres (free)
+#   inventory-web  ONE web service running Dockerfile.render: the Express API serves the built React app
+#                  too, so no private service / second web service is needed (neither works on Free).
+#
+# Free-plan limits you should know (details in RENDER.md):
+#   * The web service sleeps after 15 min without traffic; the next request takes ~1 min to wake it.
+#   * The free Postgres EXPIRES 30 days after creation (14-day grace period to upgrade, then it is
+#     deleted). Take a backup before then, or upgrade the database plan.
+#   * The web service's filesystem is ephemeral: backups written to /app/backups vanish on every
+#     restart/redeploy. Download them from the Backups page right after creating them.
+#   * Region: keep the database and the web service in the SAME region (private networking only works
+#     inside one region, and the internal database URL used below depends on it).
+# =============================================================================
+
+databases:
+  - name: inventory-db
+    databaseName: inventory
+    user: inventory
+    plan: free
+    region: oregon
+    postgresMajorVersion: "16" # keep in step with postgresql16-client in Dockerfile.render (pg_dump)
+    ipAllowList: [] # no public access; the web service reaches it over Render's private network
+
+services:
+  - type: web
+    name: inventory-web
+    runtime: docker
+    dockerfilePath: ./Dockerfile.render
+    dockerContext: .
+    plan: free
+    region: oregon # must match the database's region
+    healthCheckPath: /api/health # 200 only when the API can also reach the database
+    autoDeploy: true # redeploy on every push to the connected branch
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+
+      # Internal connection string: private network, no TLS needed (so DATABASE_SSL stays unset).
+      - key: DATABASE_URL
+        fromDatabase:
+          name: inventory-db
+          property: connectionString
+
+      # Signs every login token. Generated once by Render, never stored in git. Changing it signs
+      # everyone out.
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_EXPIRES_IN
+        value: 7d
+
+      # --- first start only (ignored once the database has a user) -------------------------------
+      # Creates `admin` + the standard units, with NO demo data and NO well-known passwords.
+      # The generated admin password: Render dashboard -> inventory-web -> Environment ->
+      # SEED_ADMIN_PASSWORD (click the eye icon). Sign in, then change it under My profile.
+      # Want the sample data (items, events, a `staff` user) for a demo? Set SEED_DEMO_DATA to true
+      # BEFORE the first deploy (see RENDER.md). Demo mode also creates `staff`; set
+      # SEED_STAFF_PASSWORD too, or it gets the public demo password `staff123`.
+      - key: SEED_DEMO_DATA
+        value: false
+      - key: SEED_ADMIN_PASSWORD
+        generateValue: true
+
+      # Single reverse proxy (Render's load balancer) in front of the app, so req.ip is the real client
+      - key: TRUST_PROXY
+        value: 1
+
+      # Backups are written here. EPHEMERAL on the free plan (see the note at the top).
+      - key: BACKUP_DIR
+        value: /app/backups
