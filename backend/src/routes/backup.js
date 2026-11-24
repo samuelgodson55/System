@@ -4,6 +4,7 @@ import { promisify } from 'util'
 import fs from 'fs'
 import path from 'path'
 import crypto from 'crypto'
+import zlib from 'zlib'
 import readline from 'readline'
 import { Transform } from 'stream'
 import { pipeline } from 'stream/promises'
@@ -182,6 +183,10 @@ router.post('/upload', async (req, res) => {
       rawName = ''
     }
     if (!/\.sql$/i.test(rawName)) return res.status(400).json({ error: 'Choose a .sql backup file' })
+    // The browser gzips the file before sending (see api.uploadBackup): hosting firewalls (Render sits behind
+    // Cloudflare) block request bodies that look like SQL statements with a bare 403, so the SQL must not
+    // travel as plain text. The size limit below applies to the UNPACKED data, so a tiny gzip bomb is refused.
+    const gzipped = String(req.headers['x-upload-encoding'] || '').toLowerCase() === 'gzip'
 
     let received = 0
     const limiter = new Transform({
@@ -195,7 +200,15 @@ router.post('/upload', async (req, res) => {
         cb(null, chunk)
       },
     })
-    await pipeline(req, limiter, fs.createWriteStream(tmp, { flags: 'wx' }))
+    const stages = gzipped ? [req, zlib.createGunzip(), limiter] : [req, limiter]
+    try {
+      await pipeline(...stages, fs.createWriteStream(tmp, { flags: 'wx' }))
+    } catch (e) {
+      if (e?.code && String(e.code).startsWith('Z_')) {
+        return res.status(400).json({ error: 'The uploaded file is damaged (it could not be unpacked). Download it again and retry.' })
+      }
+      throw e
+    }
     if (received === 0) return res.status(400).json({ error: 'The file is empty' })
 
     const problem = await inspectDump(tmp)
