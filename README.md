@@ -99,7 +99,12 @@ Postgres data lives in the `pgdata` Docker volume. Backups are written to `./bac
 1. Sign in as `admin`
 2. Open **Backups** in the sidebar
 3. Click **Create Backup**
-4. Download the `.sql` file
+4. Download the `.sql` file (ticked by default: a copy is downloaded automatically)
+
+Restore from a file on your computer: **Backups → Upload & Restore**, choose the `.sql` file, confirm.
+The upload is checked first (it must be a pg_dump backup of this system and may not contain psql commands),
+and the current data is saved automatically as `inventory_before_restore_…` before anything is replaced.
+Upload limit: 200 MB (`BACKUP_UPLOAD_MAX_MB`).
 
 Restore manually:
 
@@ -193,6 +198,8 @@ inventory-system/
 | GET | `/api/exports/full` | Admin: whole database as JSON (no password hashes). Not a restore file |
 | GET/POST | `/api/backups` | List / create (admin) |
 | GET/DELETE | `/api/backups/:filename` | Download / delete (admin) |
+| POST | `/api/backups/upload` | Upload a `.sql` backup (raw body, `X-Filename` header) (admin) |
+| POST | `/api/backups/:filename/restore` | Restore (admin) |
 
 ## Units per item
 
