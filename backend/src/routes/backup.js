@@ -3,6 +3,10 @@ import { execFile } from 'child_process'
 import { promisify } from 'util'
 import fs from 'fs'
 import path from 'path'
+import crypto from 'crypto'
+import readline from 'readline'
+import { Transform } from 'stream'
+import { pipeline } from 'stream/promises'
 import { authenticate, requireAdmin } from '../middleware/auth.js'
 import { markRecipientsStale } from '../services/recipients.js'
 import { pool } from '../db/pool.js'
@@ -88,6 +92,59 @@ async function dumpTo(prefix) {
 /** pg_dump / psql errors can be long and mention the connection; show the person the useful tail only. */
 const shortError = (e, fallback) => String(e?.stderr?.toString?.() || e?.message || fallback).trim().slice(-800)
 
+// ---- uploading a backup made earlier (the server's disk may be ephemeral, e.g. on Render) ------------
+const UPLOAD_MAX_BYTES = Math.max(1, Number(process.env.BACKUP_UPLOAD_MAX_MB) || 200) * 1024 * 1024
+
+/**
+ * An uploaded .sql file is fed to `psql`, which would also run its backslash meta-commands
+ * (`\\! <shell command>`, `\\copy ... program`) on THIS server. A genuine pg_dump file contains none of them
+ * outside COPY data blocks, so the file is scanned line by line BEFORE it is accepted and anything else
+ * is refused. It must also look like a dump of this application (users + items tables).
+ * Returns null when acceptable, otherwise a message for the person.
+ */
+async function inspectDump(filepath) {
+  const rl = readline.createInterface({ input: fs.createReadStream(filepath, { encoding: 'utf8' }), crlfDelay: Infinity })
+  let lineNo = 0
+  let inCopy = false
+  let sawHeader = false
+  let sawUsers = false
+  let sawItems = false
+  const bad = (why) => `Not a valid backup from this system: ${why} (line ${lineNo}).`
+  try {
+    for await (const line of rl) {
+      lineNo += 1
+      if (inCopy) {
+        if (line === '\\.') inCopy = false
+        continue // COPY rows legitimately contain backslash escapes (\\N, \\t ...)
+      }
+      if (lineNo <= 30 && line.includes('PostgreSQL database dump')) sawHeader = true
+      if (lineNo > 30 && !sawHeader) return 'This file is not a pg_dump SQL backup.'
+      if (/^\\(un)?restrict\s+\S+\s*$/.test(line)) continue // emitted by newer pg_dump versions
+      if (/^COPY\s/i.test(line)) {
+        if (!/^COPY\s.+\sFROM\s+stdin;\s*$/i.test(line)) return bad('a COPY statement reads from somewhere other than the file')
+        inCopy = true
+        continue
+      }
+      const unquoted = line.replace(/'(?:[^']|'')*'/g, "''") // a backslash inside a string literal is plain data
+      if (unquoted.includes('\\')) return bad('it contains a psql command, which is not allowed')
+      if (/\bPROGRAM\b/i.test(unquoted)) return bad('it runs an external program')
+      if (/^\s*(DROP\s+(DATABASE|ROLE|USER)|CREATE\s+(DATABASE|ROLE|USER)|ALTER\s+(ROLE|USER|SYSTEM)|SET\s+ROLE|SET\s+SESSION\s+AUTHORIZATION)\b/i.test(unquoted)) {
+        return bad('it changes database-wide settings or roles')
+      }
+      const ext = /^\s*CREATE\s+EXTENSION\s+(?:IF\s+NOT\s+EXISTS\s+)?"?(\w+)"?/i.exec(unquoted)
+      if (ext && ext[1].toLowerCase() !== 'pgcrypto') return bad(`it installs the extension "${ext[1]}"`)
+      if (/^CREATE TABLE (public\.)?users\b/i.test(line)) sawUsers = true
+      if (/^CREATE TABLE (public\.)?items\b/i.test(line)) sawItems = true
+    }
+  } finally {
+    rl.close()
+  }
+  if (inCopy) return 'The file ends in the middle of a table (it looks cut off or incomplete).'
+  if (!sawHeader) return 'This file is not a pg_dump SQL backup.'
+  if (!sawUsers || !sawItems) return 'This file does not look like a backup of this inventory system (users / items tables not found).'
+  return null
+}
+
 function safeFilename(name) {
   const base = path.basename(name)
   if (!/^[\w.\-]+$/.test(base) || !base.endsWith('.sql')) {
@@ -107,6 +164,66 @@ router.post('/', async (req, res) => {
   }
 })
 
+// Upload a backup file (raw request body, name in the X-Filename header). The file is checked and then
+// stored next to the other backups; restoring it is a separate, confirmed step. Streamed to disk, so a
+// large dump never sits in memory.
+router.post('/upload', async (req, res) => {
+  ensureBackupDir()
+  const tmp = path.join(BACKUP_DIR, `.upload-${crypto.randomBytes(6).toString('hex')}.tmp`)
+  try {
+    const declared = Number(req.headers['content-length'])
+    if (declared > UPLOAD_MAX_BYTES) {
+      return res.status(413).json({ error: `File is too large (limit ${Math.round(UPLOAD_MAX_BYTES / 1024 / 1024)} MB)` })
+    }
+    let rawName = ''
+    try {
+      rawName = decodeURIComponent(String(req.headers['x-filename'] || ''))
+    } catch {
+      rawName = ''
+    }
+    if (!/\.sql$/i.test(rawName)) return res.status(400).json({ error: 'Choose a .sql backup file' })
+
+    let received = 0
+    const limiter = new Transform({
+      transform(chunk, _enc, cb) {
+        received += chunk.length
+        if (received > UPLOAD_MAX_BYTES) {
+          const err = new Error(`File is too large (limit ${Math.round(UPLOAD_MAX_BYTES / 1024 / 1024)} MB)`)
+          err.status = 413
+          return cb(err)
+        }
+        cb(null, chunk)
+      },
+    })
+    await pipeline(req, limiter, fs.createWriteStream(tmp, { flags: 'wx' }))
+    if (received === 0) return res.status(400).json({ error: 'The file is empty' })
+
+    const problem = await inspectDump(tmp)
+    if (problem) return res.status(400).json({ error: problem })
+
+    const base = path
+      .basename(rawName, path.extname(rawName))
+      .replace(/[^\w.\-]+/g, '_')
+      .replace(/^[._]+/, '')
+      .slice(0, 80) || 'backup'
+    let filename = `uploaded_${stampNow()}_${base}.sql`
+    for (let n = 2; fs.existsSync(path.join(BACKUP_DIR, filename)); n++) filename = `uploaded_${stampNow()}_${base}-${n}.sql`
+    fs.renameSync(tmp, path.join(BACKUP_DIR, filename))
+    const stat = fs.statSync(path.join(BACKUP_DIR, filename))
+    res.status(201).json({
+      filename,
+      size: stat.size,
+      createdAt: stat.mtime.toISOString(),
+      message: 'Backup uploaded. Review it and choose Restore to apply it.',
+    })
+  } catch (e) {
+    console.error('Backup upload failed:', e)
+    if (!res.headersSent) res.status(e.status || 500).json({ error: e.status ? e.message : 'Upload failed – please try again' })
+  } finally {
+    fs.rmSync(tmp, { force: true })
+  }
+})
+
 // List backups
 router.get('/', async (_req, res) => {
   try {
@@ -118,6 +235,7 @@ router.get('/', async (_req, res) => {
         const stat = fs.statSync(path.join(BACKUP_DIR, f))
         return {
           filename: f,
+          kind: f.startsWith('uploaded_') ? 'uploaded' : f.startsWith('inventory_before_restore_') ? 'safety' : 'manual',
           size: stat.size,
           createdAt: stat.mtime.toISOString(),
         }
