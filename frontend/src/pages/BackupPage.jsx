@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import {
   Database,
   Download,
@@ -7,6 +7,7 @@ import {
   RefreshCw,
   RotateCcw,
   AlertTriangle,
+  Upload,
 } from 'lucide-react'
 import { api } from '../utils/api'
 import { useAuth } from '../context/AuthContext'
@@ -30,6 +31,10 @@ export default function BackupPage() {
   const [confirmRestore, setConfirmRestore] = useState(null)
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
+  const [uploading, setUploading] = useState(false)
+  const [uploadPct, setUploadPct] = useState(0)
+  const [downloadOnCreate, setDownloadOnCreate] = useState(true)
+  const fileInput = useRef(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -64,6 +69,7 @@ export default function BackupPage() {
     try {
       const result = await api.createBackup()
       setMessage(`Backup created: ${result.filename} (${formatBytes(result.size)})`)
+      if (downloadOnCreate) await handleDownload(result.filename)
       await load()
     } catch (e) {
       setError(e.message)
@@ -85,6 +91,30 @@ export default function BackupPage() {
       setTimeout(() => URL.revokeObjectURL(url), 10000) // revoking at once can cancel the download in some browsers
     } catch (e) {
       setError(e.message)
+    }
+  }
+
+  const handleUploadChosen = async (e) => {
+    const file = e.target.files?.[0]
+    e.target.value = '' // lets the same file be chosen again after a failed attempt
+    if (!file) return
+    setError('')
+    setMessage('')
+    if (!/\.sql$/i.test(file.name)) {
+      setError('Choose a .sql backup file (one downloaded from this page).')
+      return
+    }
+    setUploading(true)
+    setUploadPct(0)
+    try {
+      const result = await api.uploadBackup(file, setUploadPct)
+      setMessage(`Uploaded ${result.filename} (${formatBytes(result.size)}). Confirm below to restore it.`)
+      await load()
+      setConfirmRestore(result.filename) // straight to the confirmation step
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setUploading(false)
     }
   }
 
@@ -129,12 +159,37 @@ export default function BackupPage() {
           <button onClick={load} className="btn-secondary" disabled={loading}>
             <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} /> Refresh
           </button>
+          <input
+            ref={fileInput}
+            type="file"
+            accept=".sql,application/sql,text/plain"
+            className="hidden"
+            onChange={handleUploadChosen}
+          />
+          <button
+            onClick={() => fileInput.current?.click()}
+            className="btn-secondary"
+            disabled={uploading || !!restoring}
+          >
+            <Upload className="h-4 w-4" />
+            {uploading ? `Uploading ${uploadPct}%` : 'Upload & Restore'}
+          </button>
           <button onClick={handleCreate} className="btn-primary" disabled={creating}>
             <Plus className="h-4 w-4" />
             {creating ? 'Creating…' : 'Create Backup'}
           </button>
         </div>
       </div>
+
+      <label className="flex items-center gap-2 text-sm text-slate-600">
+        <input
+          type="checkbox"
+          checked={downloadOnCreate}
+          onChange={(e) => setDownloadOnCreate(e.target.checked)}
+          className="h-4 w-4 rounded border-slate-300"
+        />
+        Also download a copy to this device when I create a backup (recommended)
+      </label>
 
       {error && (
         <div className="rounded-lg bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>
@@ -153,6 +208,13 @@ export default function BackupPage() {
             <button onClick={handleCreate} className="btn-primary mt-4" disabled={creating}>
               <Plus className="h-4 w-4" /> Create first backup
             </button>
+            <button
+              onClick={() => fileInput.current?.click()}
+              className="mt-2 text-sm text-primary-600 hover:underline"
+              disabled={uploading}
+            >
+              or upload a backup file you downloaded earlier
+            </button>
           </div>
         ) : (
           <table className="w-full text-left text-sm">
@@ -167,7 +229,19 @@ export default function BackupPage() {
             <tbody className="divide-y divide-slate-100">
               {backups.map((b) => (
                 <tr key={b.filename} className="hover:bg-slate-50">
-                  <td className="px-4 py-3 font-mono text-xs">{b.filename}</td>
+                  <td className="px-4 py-3 font-mono text-xs">
+                    {b.filename}
+                    {b.kind === 'uploaded' && (
+                      <span className="ml-2 rounded bg-blue-100 px-1.5 py-0.5 font-sans text-[10px] font-medium text-blue-700">
+                        uploaded
+                      </span>
+                    )}
+                    {b.kind === 'safety' && (
+                      <span className="ml-2 rounded bg-slate-100 px-1.5 py-0.5 font-sans text-[10px] font-medium text-slate-600">
+                        auto, before restore
+                      </span>
+                    )}
+                  </td>
                   <td className="px-4 py-3 text-slate-600">{formatBytes(b.size)}</td>
                   <td className="px-4 py-3 text-slate-500">{formatDateTime(b.createdAt)}</td>
                   <td className="px-4 py-3">
@@ -205,7 +279,10 @@ export default function BackupPage() {
 
       <div className="rounded-lg border border-blue-100 bg-blue-50 px-4 py-3 text-sm text-blue-800">
         <strong>Note:</strong> Backups are SQL dumps from <code>pg_dump</code>.
-        Restore overwrites current data with the selected dump. Prefer creating a fresh backup first.
+        Restore overwrites current data with the selected dump; the current state is saved automatically first.
+        The server&apos;s disk may be wiped on restart or redeploy (e.g. on Render), so <strong>download your
+        backups</strong> and keep them somewhere safe. To restore one later, use <strong>Upload &amp; Restore</strong>.
+        After a restore you may be signed out if your account is not in that backup.
       </div>
 
       <Modal
@@ -221,7 +298,8 @@ export default function BackupPage() {
               <p className="font-medium">This will overwrite current data</p>
               <p className="mt-1 text-amber-800">
                 Restoring <code className="rounded bg-amber-100 px-1">{confirmRestore}</code> applies
-                that dump to the live database. Create a new backup first if you may need to undo.
+                that dump to the live database. The current data is saved automatically first, so you can undo
+                from the list.
               </p>
             </div>
           </div>
