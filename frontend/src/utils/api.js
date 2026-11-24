@@ -182,9 +182,19 @@ export const api = {
       headers: { Authorization: `Bearer ${token}` },
     })
   },
-  /** Upload a .sql backup (raw body, streamed). onProgress receives 0-100. */
-  uploadBackup: (file, onProgress) =>
-    new Promise((resolve, reject) => {
+  /**
+   * Upload a .sql backup (streamed). onProgress receives 0-100.
+   * The file is gzip-compressed in the browser first: hosted firewalls (Render/Cloudflare) reject a request
+   * body that looks like SQL with a bare 403, and compressed bytes are also several times smaller to send.
+   */
+  uploadBackup: async (file, onProgress) => {
+    let body = file
+    let encoding = ''
+    if (typeof CompressionStream !== 'undefined' && file.stream) {
+      body = await new Response(file.stream().pipeThrough(new CompressionStream('gzip'))).blob()
+      encoding = 'gzip'
+    }
+    return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest()
       xhr.open('POST', `${API_BASE}/backups/upload`)
       xhr.timeout = LONG_TIMEOUT_MS * 2
@@ -192,29 +202,41 @@ export const api = {
       if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`)
       xhr.setRequestHeader('Content-Type', 'application/octet-stream')
       xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name))
+      if (encoding) xhr.setRequestHeader('X-Upload-Encoding', encoding)
       xhr.upload.onprogress = (e) => {
         if (e.lengthComputable && onProgress) onProgress(Math.round((e.loaded / e.total) * 100))
       }
       xhr.onerror = () => reject(new Error('Cannot reach the server. Check your connection and try again.'))
       xhr.ontimeout = () => reject(new Error('The upload took too long. Check your connection and try again.'))
       xhr.onload = () => {
-        let data = {}
+        let data = null
         try {
-          data = JSON.parse(xhr.responseText || '{}')
+          data = JSON.parse(xhr.responseText || '')
         } catch {
-          /* non-JSON error page from a proxy */
+          /* not JSON: an error page from a proxy / firewall rather than from the API */
         }
-        if (xhr.status === 401) {
+        if (xhr.status === 401 && data) {
           localStorage.removeItem('inventory_token')
           localStorage.removeItem('inventory_user')
           window.location.assign('/login')
         }
-        if (xhr.status >= 200 && xhr.status < 300) return resolve(data)
-        const msg = xhr.status === 413 ? data.error || 'File is too large for the server' : data.error || `Upload failed (${xhr.status})`
-        reject(new Error(msg))
+        if (xhr.status >= 200 && xhr.status < 300) return resolve(data || {})
+        if (!data?.error) {
+          return reject(
+            new Error(
+              xhr.status === 403
+                ? 'The hosting firewall blocked this upload (403). Try again; if it keeps happening, restore with the psql command in RENDER.md.'
+                : xhr.status === 413
+                  ? 'The file is too large for the server.'
+                  : `Upload failed (${xhr.status}).`
+            )
+          )
+        }
+        reject(new Error(data.error))
       }
-      xhr.send(file)
-    }),
+      xhr.send(body)
+    })
+  },
   deleteBackup: (filename) =>
     request(`/backups/${encodeURIComponent(filename)}`, { method: 'DELETE' }),
 
