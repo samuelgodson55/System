@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { Plus, Pencil, KeyRound, Trash2, Users, Copy, CheckCircle2, ShieldCheck, AlertTriangle } from 'lucide-react'
 import { api } from '../utils/api'
 import { useAuth } from '../context/AuthContext'
+import { useSite } from '../context/SiteContext'
 import Modal from '../components/Modal'
 import StatusBadge from '../components/StatusBadge'
 import EmptyState from '../components/EmptyState'
@@ -73,6 +74,7 @@ function TempPasswordModal({ info, onClose }) {
 
 export default function UsersPage() {
   const { user: me } = useAuth()
+  const { sites, activeSiteId } = useSite()
   const [users, setUsers] = useState([])
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState('')
@@ -110,8 +112,8 @@ export default function UsersPage() {
     setError('')
     setAdminPassword('')
     setNotice('')
-    if (kind === 'create') setForm({ username: '', name: '', role: 'staff', password: '' })
-    if (kind === 'edit') setForm({ name: user.name, role: user.role })
+    if (kind === 'create') setForm({ username: '', name: '', role: 'staff', password: '', siteId: activeSiteId || sites[0]?.id || '' })
+    if (kind === 'edit') setForm({ name: user.name, role: user.role, siteId: user.siteId || activeSiteId || sites[0]?.id || '' })
     if (kind === 'reset') setForm({ password: '' })
   }
   const close = () => setDialog(null)
@@ -128,6 +130,7 @@ export default function UsersPage() {
           username: form.username.trim(),
           name: form.name.trim(),
           role: form.role,
+          ...(form.role === 'staff' ? { siteId: form.siteId } : {}),
           ...(form.password ? { password: form.password } : {}),
           adminPassword,
         })
@@ -136,11 +139,15 @@ export default function UsersPage() {
         const body = { adminPassword }
         if (form.name.trim() !== user.name) body.name = form.name.trim()
         if (form.role !== user.role) body.role = form.role
+        if (form.role === 'staff' && form.siteId !== (user.siteId || '')) body.siteId = form.siteId
+        // moving to another site (or changing role) signs the person out so their screen reloads for the new access
         await api.updateUser(user.id, body)
         setNotice(
           body.role
             ? `${user.username} is now ${body.role === 'admin' ? 'an admin' : 'staff'} and has been signed out.`
-            : 'Saved.'
+            : body.siteId
+              ? `${user.username} now works at ${sites.find((x) => x.id === body.siteId)?.name || 'the chosen site'} and has been signed out.`
+              : 'Saved.'
         )
       } else if (kind === 'reset') {
         const res = await api.resetUserPassword(user.id, {
@@ -164,6 +171,23 @@ export default function UsersPage() {
 
   const set = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.value }))
   const adminCount = users.filter((u) => u.role === 'admin').length
+
+  const siteSelect = form.role === 'admin' ? (
+    <p className="rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-600">
+      Admins are not tied to a site: they can switch between all sites from the header.
+    </p>
+  ) : (
+    <div>
+      <label className="mb-1.5 block text-sm font-medium text-slate-700">Site</label>
+      <select className="input" value={form.siteId || ''} onChange={set('siteId')} required>
+        <option value="" disabled>Choose a site…</option>
+        {sites.map((s) => (
+          <option key={s.id} value={s.id}>{s.name}{s.isActive ? '' : ' (deactivated)'}</option>
+        ))}
+      </select>
+      <p className="mt-1 text-xs text-slate-500">Staff only see and work with the stock of this site.</p>
+    </div>
+  )
 
   const roleSelect = (
     <div>
@@ -206,6 +230,7 @@ export default function UsersPage() {
                   <th className="px-4 py-3 font-medium">Name</th>
                   <th className="px-4 py-3 font-medium">Username</th>
                   <th className="px-4 py-3 font-medium">Role</th>
+                  <th className="px-4 py-3 font-medium">Site</th>
                   <th className="px-4 py-3 font-medium">Status</th>
                   <th className="px-4 py-3 font-medium">Created</th>
                   <th className="px-4 py-3 text-right font-medium">Actions</th>
@@ -227,6 +252,9 @@ export default function UsersPage() {
                             {u.role}
                           </span>
                         </StatusBadge>
+                      </td>
+                      <td className="px-4 py-3 text-xs text-slate-600">
+                        {u.role === 'admin' ? <span className="text-slate-400">All sites</span> : u.siteName || <span className="text-red-600">Not assigned</span>}
                       </td>
                       <td className="px-4 py-3 text-xs text-slate-500">
                         {u.mustChangePassword ? 'Must set a new password' : 'Active'}
@@ -299,6 +327,7 @@ export default function UsersPage() {
                   <p className="mt-1 text-xs text-slate-500">3–50 characters: letters, numbers, dot, dash, underscore.</p>
                 </div>
                 {roleSelect}
+                {siteSelect}
                 <div>
                   <label className="mb-1.5 block text-sm font-medium text-slate-700">Temporary password (optional)</label>
                   <input className="input" value={form.password} onChange={set('password')} autoComplete="off" placeholder="Leave blank to generate one" />
@@ -314,9 +343,10 @@ export default function UsersPage() {
                   <input className="input" value={form.name} onChange={set('name')} maxLength={120} required />
                 </div>
                 {roleSelect}
-                {form.role !== dialog.user.role && (
+                {siteSelect}
+                {(form.role !== dialog.user.role || (form.role === 'staff' && form.siteId !== (dialog.user.siteId || ''))) && (
                   <p className="rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-900">
-                    Changing the role signs {dialog.user.username} out; they sign in again with the new access.
+                    Changing the role or site signs {dialog.user.username} out; they sign in again with the new access.
                   </p>
                 )}
               </>
@@ -349,7 +379,14 @@ export default function UsersPage() {
               <button
                 type="submit"
                 className={dialog.kind === 'remove' ? 'btn-danger' : 'btn-primary'}
-                disabled={busy || (dialog.kind === 'edit' && form.name.trim() === dialog.user.name && form.role === dialog.user.role)}
+                disabled={
+                  busy ||
+                  (dialog.kind === 'create' && form.role === 'staff' && !form.siteId) ||
+                  (dialog.kind === 'edit' &&
+                    form.name.trim() === dialog.user.name &&
+                    form.role === dialog.user.role &&
+                    (form.role === 'admin' || form.siteId === (dialog.user.siteId || '')))
+                }
               >
                 {busy ? 'Working…' : { create: 'Create user', edit: 'Save', reset: 'Reset password', remove: 'Remove user' }[dialog.kind]}
               </button>

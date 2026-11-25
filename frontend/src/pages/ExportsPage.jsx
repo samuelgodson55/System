@@ -5,6 +5,7 @@ import { api } from '../utils/api'
 import { downloadBlob } from '../utils/export'
 import { useAuth } from '../context/AuthContext'
 import { useInventory } from '../context/InventoryContext'
+import { useSite } from '../context/SiteContext'
 import ServerExportButtons from '../components/ServerExportButtons'
 import Select from '../components/Select'
 
@@ -159,6 +160,7 @@ function FullExportCard() {
 }
 
 export default function ExportsPage() {
+  const { activeSite, isMultiSite } = useSite()
   const { user } = useAuth()
   const isAdmin = user?.role === 'admin'
   const [catalog, setCatalog] = useState(null)
@@ -191,6 +193,12 @@ export default function ExportsPage() {
         <p className="text-sm text-slate-500">
           Download your data as CSV (opens in Excel / Google Sheets, complete, no row limit) or a
           printable PDF. Times use this device&apos;s time zone.
+          {isMultiSite && activeSite && (
+            <>
+              {' '}Reports cover <strong className="font-semibold text-slate-700">{activeSite.name}</strong> only; switch site
+              in the header to export another.
+            </>
+          )}
         </p>
       </div>
 

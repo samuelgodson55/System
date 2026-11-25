@@ -19,6 +19,7 @@ import ExportsPage from './pages/ExportsPage'
 import FaultsPage from './pages/FaultsPage'
 import ActivityPage from './pages/ActivityPage'
 import UsersPage from './pages/UsersPage'
+import SitesPage from './pages/SitesPage'
 
 function ProtectedRoute({ children }) {
   const { user, loading } = useAuth()
@@ -64,6 +65,7 @@ export default function App() {
         <Route path="backups" element={<BackupPage />} />
         <Route path="profile" element={<ProfilePage />} />
         <Route path="settings" element={<SettingsPage />} />
+        <Route path="sites" element={<SitesPage />} />
         <Route path="users" element={<UsersPage />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />

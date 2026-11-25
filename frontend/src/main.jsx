@@ -4,6 +4,7 @@ import { BrowserRouter } from 'react-router-dom'
 import App from './App'
 import ErrorBoundary from './components/ErrorBoundary'
 import { AuthProvider } from './context/AuthContext'
+import { SiteProvider } from './context/SiteContext'
 import { BrandingProvider } from './context/BrandingContext'
 import { InventoryProvider } from './context/InventoryContext'
 import './index.css'
@@ -14,9 +15,11 @@ ReactDOM.createRoot(document.getElementById('root')).render(
       <ErrorBoundary>
         <BrandingProvider>
           <AuthProvider>
-            <InventoryProvider>
-              <App />
-            </InventoryProvider>
+            <SiteProvider>
+              <InventoryProvider>
+                <App />
+              </InventoryProvider>
+            </SiteProvider>
           </AuthProvider>
         </BrandingProvider>
       </ErrorBoundary>

@@ -17,6 +17,9 @@ import Pagination from '../components/Pagination'
 import { baseAbbr, fmtQty } from '../utils/units'
 import ServerExportButtons from '../components/ServerExportButtons'
 import { useFaultSummary } from '../utils/faults'
+import { useAuth } from '../context/AuthContext'
+import { useSite } from '../context/SiteContext'
+import SitesOverview from '../components/SitesOverview'
 
 // rows visible per section on the dashboard
 const PAGE_SIZE = 5
@@ -24,6 +27,8 @@ const PAGE_SIZE = 5
 export default function Dashboard() {
   const { items, events, units, getUnit } = useInventory()
   const faults = useFaultSummary()
+  const { user } = useAuth()
+  const { activeSite, isMultiSite } = useSite()
   // Numbers come from the server, so the dashboard stays fast however long the ledger gets.
   // Low stock and recent activity are paged on the server too: only PAGE_SIZE rows are fetched at a time.
   const [stats, setStats] = useState(null)
@@ -106,7 +111,9 @@ export default function Dashboard() {
     <div className="space-y-6">
       <div>
         <h1 className="text-2xl font-bold text-slate-900">Dashboard</h1>
-        <p className="text-sm text-slate-500">Overview of your inventory</p>
+        <p className="text-sm text-slate-500">
+          Overview of {isMultiSite && activeSite ? <strong className="font-semibold text-slate-700">{activeSite.name}</strong> : 'your inventory'}
+        </p>
       </div>
 
       {/* Stats */}
@@ -123,6 +130,8 @@ export default function Dashboard() {
           </div>
         ))}
       </div>
+
+      {user?.role === 'admin' && isMultiSite && <SitesOverview />}
 
       {faults.open > 0 && (
         <Link to="/faults" className="card flex flex-wrap items-center gap-4 border-amber-200 bg-amber-50 p-4 hover:shadow-md">

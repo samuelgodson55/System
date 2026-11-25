@@ -1,6 +1,7 @@
-import { createContext, useContext, useState, useCallback, useEffect, useMemo } from 'react'
+import { createContext, useContext, useState, useCallback, useEffect, useMemo, useRef } from 'react'
 import { api } from '../utils/api'
 import { useAuth } from './AuthContext'
+import { useSite } from './SiteContext'
 
 const InventoryContext = createContext(null)
 
@@ -23,6 +24,7 @@ async function fetchAllItems() {
 
 export function InventoryProvider({ children }) {
   const { user } = useAuth()
+  const { ready: siteReady, siteKey } = useSite()
   const [items, setItems] = useState([])
   const [units, setUnits] = useState([])
   const [events, setEvents] = useState([])
@@ -30,6 +32,8 @@ export function InventoryProvider({ children }) {
   const [categoryRecords, setCategoryRecords] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
+  // a slow answer for the site just left must never overwrite the one now shown
+  const loadId = useRef(0)
 
   const refresh = useCallback(async () => {
     if (!user) {
@@ -41,6 +45,12 @@ export function InventoryProvider({ children }) {
       setLoading(false)
       return
     }
+    // wait until the working site is known (an admin's saved choice), so the wrong site never flashes
+    if (!siteReady) {
+      setLoading(true)
+      return
+    }
+    const mine = ++loadId.current
     setLoading(true)
     setError(null)
     try {
@@ -50,18 +60,27 @@ export function InventoryProvider({ children }) {
         api.getEvents(),
         api.getCategoryList().catch(() => []),
       ])
+      if (mine !== loadId.current) return
       setItems(itemsRes)
       setCategoryRecords(catsRes)
       setServerCategories(catsRes.map((c) => c.name))
       setUnits(unitsRes)
       setEvents(eventsRes)
     } catch (e) {
+      if (mine !== loadId.current) return
       console.error(e)
       setError(e.message)
     } finally {
-      setLoading(false)
+      if (mine === loadId.current) setLoading(false)
     }
-  }, [user])
+    // siteKey: switching site reloads everything for the new site
+  }, [user, siteReady, siteKey])
+
+  // Switching site: drop the previous site's stock and events straight away rather than showing them while loading
+  useEffect(() => {
+    setItems([])
+    setEvents([])
+  }, [siteKey])
 
   useEffect(() => {
     refresh()

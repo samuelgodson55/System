@@ -14,6 +14,14 @@ const listeners = new Set()
 
 const emit = () => listeners.forEach((l) => l())
 
+/** Drop cached numbers and reload: called when the working site changes. */
+export function resetFaultSummary() {
+  summary = EMPTY
+  lastFetch = 0
+  emit()
+  return refreshFaultSummary()
+}
+
 export function refreshFaultSummary() {
   if (inflight) return inflight
   inflight = api

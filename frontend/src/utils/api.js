@@ -4,6 +4,29 @@ function getToken() {
   return localStorage.getItem('inventory_token')
 }
 
+// The site an ADMIN is working in. Sent on every request as X-Site-Id; the server ignores it for staff,
+// who always work in the site assigned to their account. SiteContext keeps it up to date.
+const SITE_KEY = 'inventory_site'
+export const getActiveSiteId = () => {
+  try {
+    return localStorage.getItem(SITE_KEY) || ''
+  } catch {
+    return ''
+  }
+}
+export const setActiveSiteId = (id) => {
+  try {
+    if (id) localStorage.setItem(SITE_KEY, id)
+    else localStorage.removeItem(SITE_KEY)
+  } catch {
+    /* storage unavailable: the server falls back to the default site */
+  }
+}
+const siteHeader = () => {
+  const id = getActiveSiteId()
+  return id ? { 'X-Site-Id': id } : {}
+}
+
 // A request that never answers (server down, network dropped) must not leave a button spinning forever.
 // Backups, restores and exports legitimately take minutes, so they get a longer allowance.
 const DEFAULT_TIMEOUT_MS = 60_000
@@ -13,6 +36,7 @@ const isLongPath = (path) => path.startsWith('/backups') || path.startsWith('/ex
 async function request(path, options = {}) {
   const headers = {
     'Content-Type': 'application/json',
+    ...siteHeader(),
     ...options.headers,
   }
   const token = getToken()
@@ -68,7 +92,7 @@ const browserTz = () => {
 
 /** Fetch an export as a file (authenticated) and return { blob, filename }. */
 async function fetchFile(path) {
-  const res = await fetch(`${API_BASE}${path}`, { headers: { Authorization: `Bearer ${getToken()}` } })
+  const res = await fetch(`${API_BASE}${path}`, { headers: { Authorization: `Bearer ${getToken()}`, ...siteHeader() } })
   if (!res.ok) {
     if (res.status === 401) {
       localStorage.removeItem('inventory_token')
@@ -105,6 +129,13 @@ export const api = {
     request(`/users/${id}/reset-password`, { method: 'POST', body: JSON.stringify(data) }),
   deleteUser: (id, adminPassword) =>
     request(`/users/${id}`, { method: 'DELETE', body: JSON.stringify({ adminPassword }) }),
+
+  // Sites (stores / locations). Staff only ever see their own; admins manage them all.
+  getSites: () => request('/sites'),
+  getSitesOverview: () => request('/sites/overview'),
+  createSite: (data) => request('/sites', { method: 'POST', body: JSON.stringify(data) }),
+  updateSite: (id, data) => request(`/sites/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteSite: (id) => request(`/sites/${id}`, { method: 'DELETE' }),
 
   getBranding: () => request('/settings/branding'),
   updateBranding: (data) =>

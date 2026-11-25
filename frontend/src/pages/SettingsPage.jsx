@@ -79,7 +79,10 @@ export default function SettingsPage() {
             maxLength={200}
             placeholder="e.g. Main Store, Nairobi"
           />
-          <p className="mt-1 text-xs text-slate-500">Leave a field empty to remove it.</p>
+          <p className="mt-1 text-xs text-slate-500">
+            Leave a field empty to remove it. Once you work with sites, each site's own name (see Sites) is shown in
+            the header and on exports instead of this line.
+          </p>
         </div>
 
         <div className="flex justify-end">

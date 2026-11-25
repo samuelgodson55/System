@@ -20,10 +20,13 @@ import {
   FileDown,
   AlertTriangle,
   Users,
+  Store,
+  ChevronDown,
 } from 'lucide-react'
 import { useState } from 'react'
 import { useAuth } from '../context/AuthContext'
 import { useBranding } from '../context/BrandingContext'
+import { useSite } from '../context/SiteContext'
 import { useFaultSummary } from '../utils/faults'
 
 const navItems = [
@@ -38,13 +41,17 @@ const navItems = [
   { to: '/faults', icon: AlertTriangle, label: 'Faulty Items', badge: 'faults' },
   { to: '/exports', icon: FileDown, label: 'Reports & Exports' },
   { to: '/backups', icon: Database, label: 'Backups', adminOnly: true },
+  { to: '/sites', icon: Store, label: 'Sites', adminOnly: true },
   { to: '/users', icon: Users, label: 'Users', adminOnly: true },
   { to: '/settings', icon: Settings, label: 'Settings', adminOnly: true },
 ]
 
 export default function Layout() {
   const { user, logout } = useAuth()
-  const { companyName, siteLocation, displayName } = useBranding()
+  const { companyName, siteLocation: brandingSite, displayName } = useBranding()
+  const { sites, activeSite, activeSiteId, siteKey, canSwitch, switchSite, ready: siteReady } = useSite()
+  // the site being worked in replaces the old free-text "site location" wherever it was shown
+  const siteLocation = activeSite?.name || brandingSite
   const faultSummary = useFaultSummary()
   const navigate = useNavigate()
   const location = useLocation()
@@ -172,16 +179,60 @@ export default function Layout() {
             {companyName ? companyName : 'Local Inventory Manager'}
             {siteLocation && <span className="font-normal text-slate-400"> · {siteLocation}</span>}
           </h1>
-          {!isHome && (
-            <button
-              onClick={() => navigate('/')}
-              className="ml-auto flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm text-slate-500 hover:bg-slate-100"
-              title="Dashboard"
-            >
-              <Home className="h-4 w-4" /> <span className="hidden sm:inline">Dashboard</span>
-            </button>
-          )}
+          <div className="ml-auto flex min-w-0 items-center gap-2">
+            {canSwitch && (
+              <label className="relative flex min-w-0 items-center" title="Switch site">
+                <span className="sr-only">Site</span>
+                <Store className="pointer-events-none absolute left-2.5 h-4 w-4 text-primary-600" />
+                <select
+                  value={activeSiteId}
+                  onChange={(e) => {
+                    switchSite(e.target.value)
+                    // a record open on screen belongs to the site just left: go to its list instead
+                    const section = /^\/(inventory|events)\/[^/]+/.exec(location.pathname)
+                    if (section) navigate(`/${section[1]}`)
+                  }}
+                  className="max-w-[11rem] appearance-none truncate rounded-lg border border-primary-200 bg-primary-50 py-1.5 pl-8 pr-8 text-sm font-medium text-primary-800 focus:border-primary-500 focus:outline-none focus:ring-2 focus:ring-primary-200 sm:max-w-[16rem]"
+                >
+                  {sites.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.name}{s.isActive ? '' : ' (deactivated)'}
+                    </option>
+                  ))}
+                </select>
+                <ChevronDown className="pointer-events-none absolute right-2.5 h-4 w-4 text-primary-600" />
+              </label>
+            )}
+            {!canSwitch && user?.role !== 'admin' && activeSite && (
+              <span
+                className="inline-flex max-w-[11rem] items-center gap-1.5 truncate rounded-lg bg-slate-100 px-2.5 py-1.5 text-sm font-medium text-slate-700 sm:max-w-[16rem]"
+                title={`You work at ${activeSite.name}`}
+              >
+                <Store className="h-4 w-4 shrink-0 text-slate-500" /> <span className="truncate">{activeSite.name}</span>
+              </span>
+            )}
+            {!isHome && (
+              <button
+                onClick={() => navigate('/')}
+                className="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm text-slate-500 hover:bg-slate-100"
+                title="Dashboard"
+              >
+                <Home className="h-4 w-4" /> <span className="hidden sm:inline">Dashboard</span>
+              </button>
+            )}
+          </div>
         </header>
+        {user?.role !== 'admin' && siteReady && !activeSite && !user?.mustChangePassword && (
+          <div className="border-b border-red-200 bg-red-50 px-4 py-2 text-sm text-red-800 lg:px-6">
+            <strong>No site assigned.</strong> Your account is not linked to a site yet, so stock cannot be shown. Ask an
+            administrator to assign you to one.
+          </div>
+        )}
+        {activeSite && !activeSite.isActive && (
+          <div className="border-b border-amber-200 bg-amber-50 px-4 py-2 text-sm text-amber-900 lg:px-6">
+            <strong>{activeSite.name} is deactivated.</strong> Its records can be viewed but not changed.
+          </div>
+        )}
         {user?.defaultPassword && location.pathname !== '/profile' && (
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-amber-200 bg-amber-50 px-4 py-2 text-sm text-amber-900 lg:px-6">
             <span>
@@ -199,7 +250,15 @@ export default function Layout() {
           </div>
         )}
         <main className="flex-1 overflow-y-auto p-4 lg:p-6">
-          <Outlet />
+          {/* keyed on the site: switching site remounts the page, so every screen reloads for the new site.
+              Nothing is rendered until the site is known, so no screen ever loads against a stale site. */}
+          {siteReady ? (
+            <Outlet key={siteKey} />
+          ) : (
+            <div className="flex h-40 items-center justify-center" role="status" aria-label="Loading">
+              <div className="h-8 w-8 animate-spin rounded-full border-4 border-primary-500 border-t-transparent" />
+            </div>
+          )}
         </main>
       </div>
     </div>
