@@ -18,6 +18,7 @@ import faultRoutes from './routes/faults.js'
 import categoryRoutes from './routes/categories.js'
 import recipientRoutes from './routes/recipients.js'
 import userRoutes from './routes/users.js'
+import siteRoutes from './routes/sites.js'
 
 dotenv.config()
 
@@ -86,6 +87,7 @@ app.use('/api/faults', faultRoutes)
 app.use('/api/categories', categoryRoutes)
 app.use('/api/recipients', recipientRoutes)
 app.use('/api/users', userRoutes)
+app.use('/api/sites', siteRoutes)
 
 // An unknown API path is a JSON 404 (it used to be Express's HTML error page)
 app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found' }))

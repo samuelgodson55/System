@@ -122,7 +122,10 @@ const OUTSTANDING_SQL = `
   ), 0) END`
 
 function itemFilters(p, args) {
-  const where = []
+  // every item report is limited to ONE site (the route puts the request's site on p.siteId)
+  if (!p.siteId) throw new Error('export needs a siteId')
+  args.push(p.siteId)
+  const where = [`i.site_id = $${args.length}`]
   if (p.search) {
     args.push(`%${p.search}%`)
     const n = args.length
@@ -138,7 +141,7 @@ function itemFilters(p, args) {
     where.push(`i.item_type = $${args.length}`)
   }
   if (p.lowStock) where.push('i.quantity <= i.reorder_level')
-  return where.length ? `WHERE ${where.join(' AND ')}` : ''
+  return `WHERE ${where.join(' AND ')}`
 }
 
 const col = (key, label) => ({ key, label })
@@ -217,6 +220,7 @@ async function* outstandingRows(p) {
   for (let page = 1; ; page++) {
     const res = await listOutstanding({
       search: p.search, type: p.outType, days: p.days, department: p.department, groupBy: 'recipient', page, limit: 50,
+      siteId: p.siteId,
     })
     for (const g of res.groups) {
       for (const l of g.lines) {
@@ -241,15 +245,15 @@ async function* outstandingRows(p) {
 }
 
 async function* eventRows(p) {
-  const args = []
-  const where = []
+  const args = [p.siteId]
+  const where = ['e.site_id = $1']
   if (p.status) { args.push(p.status); where.push(`e.status = $${args.length}`) }
   if (p.from) { args.push(p.from); where.push(`e.start_date >= $${args.length}::date`) }
   if (p.to) { args.push(p.to); where.push(`e.start_date <= $${args.length}::date`) }
   const { rows } = await query(
     `SELECT e.*, to_char(e.start_date, 'YYYY-MM-DD') AS start_txt, to_char(e.end_date, 'YYYY-MM-DD') AS end_txt,
             (SELECT COUNT(*) FROM transactions t WHERE t.event_id = e.id AND t.parent_txn_id IS NULL) AS txns
-     FROM events e ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+     FROM events e WHERE ${where.join(' AND ')}
      ORDER BY e.start_date DESC NULLS LAST, e.name`,
     args
   )
@@ -265,8 +269,8 @@ async function* eventRows(p) {
 }
 
 async function* eventUsageRows(p) {
-  const args = []
-  const where = ['t.event_id IS NOT NULL', 't.parent_txn_id IS NULL']
+  const args = [p.siteId]
+  const where = ['t.event_id IS NOT NULL', 't.parent_txn_id IS NULL', 'i.site_id = $1']
   if (p.eventId) { args.push(p.eventId); where.push(`t.event_id = $${args.length}`) }
   if (p.from || p.to) args.push(p.tz)
   const tzRef = `$${args.length}`
@@ -299,10 +303,12 @@ async function* eventUsageRows(p) {
   }))
 }
 
-async function* unitRows() {
+async function* unitRows(p) {
   const { rows } = await query(
-    `SELECT u.*, (SELECT COUNT(*) FROM item_units iu WHERE iu.unit_id = u.id) AS items
-     FROM units u ORDER BY u.is_base DESC, u.name`
+    `SELECT u.*, (SELECT COUNT(*) FROM item_units iu JOIN items i ON i.id = iu.item_id
+                   WHERE iu.unit_id = u.id AND i.site_id = $1) AS items
+     FROM units u ORDER BY u.is_base DESC, u.name`,
+    [p.siteId]
   )
   yield rows.map((r) => ({
     name: r.name,
@@ -314,8 +320,15 @@ async function* unitRows() {
 }
 
 async function* userRows(p) {
-  const { rows } = await query('SELECT name, username, role, created_at FROM users ORDER BY name')
-  yield rows.map((r) => ({ name: r.name, username: r.username, role: r.role, created: stamp(r.created_at, p.tz) }))
+  const { rows } = await query(
+    `SELECT u.name, u.username, u.role, u.created_at, s.name AS site
+     FROM users u LEFT JOIN sites s ON s.id = u.site_id ORDER BY u.name`
+  )
+  yield rows.map((r) => ({
+    name: r.name, username: r.username, role: r.role,
+    site: r.role === 'admin' ? 'All sites' : text(r.site),
+    created: stamp(r.created_at, p.tz),
+  }))
 }
 
 const LEDGER_SELECT = `
@@ -337,6 +350,8 @@ function ledgerFilter(p) {
   const args = [p.tz]
   const where = []
   const add = (sql, v) => { args.push(v); where.push(sql.replace('?', `$${args.length}`)) }
+  // a ledger line belongs to the site of its item
+  add('t.item_id IN (SELECT id FROM items WHERE site_id = ?)', p.siteId)
   if (p.type) add('t.type = ?', p.type)
   if (p.itemId) add('t.item_id = ?', p.itemId)
   if (p.eventId) add('t.event_id = ?', p.eventId)
@@ -399,6 +414,7 @@ async function* faultRows(p) {
   const args = [p.tz]
   const where = []
   const add = (sql, v) => { args.push(v); where.push(sql.replace('?', `$${args.length}`)) }
+  add('i.site_id = ?', p.siteId)
   if (p.faultStatus !== 'all') add('f.status = ?', p.faultStatus)
   if (p.usability) add('f.usability = ?', p.usability)
   if (p.itemId) add('f.item_id = ?', p.itemId)
@@ -711,7 +727,7 @@ export const DATASETS = {
     group: 'Setup',
     adminOnly: true,
     filters: [],
-    columns: [col('name', 'Name'), col('username', 'Username'), col('role', 'Role'), col('created', 'Created')],
+    columns: [col('name', 'Name'), col('username', 'Username'), col('role', 'Role'), col('site', 'Site'), col('created', 'Created')],
     rows: userRows,
   },
 }
@@ -755,6 +771,7 @@ export function pickColumns(dataset, requested) {
 // ---------------------------------------------------------------------------------------
 
 const FULL_TABLES = [
+  ['sites', 'SELECT * FROM sites ORDER BY created_at, id'],
   ['units', 'SELECT * FROM units ORDER BY created_at, id'],
   ['events', 'SELECT * FROM events ORDER BY created_at, id'],
   ['items', 'SELECT * FROM items ORDER BY created_at, id'],
@@ -766,7 +783,7 @@ const FULL_TABLES = [
   ['recipients', 'SELECT * FROM recipients ORDER BY lower(name), id'],
   ['recipient_audit', 'SELECT * FROM recipient_audit ORDER BY created_at, id'],
   // password hashes never leave the database
-  ['users', 'SELECT id, username, name, role, created_at FROM users ORDER BY created_at, id'],
+  ['users', 'SELECT id, username, name, role, site_id, created_at FROM users ORDER BY created_at, id'],
 ]
 
 /** Yields JSON text chunks for the whole database. */

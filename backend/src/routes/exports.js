@@ -15,6 +15,7 @@
 import { Router } from 'express'
 import { query } from '../db/pool.js'
 import { authenticate, requireAdmin } from '../middleware/auth.js'
+import { requireSite } from '../middleware/site.js'
 import {
   DATASETS, ExportError, buildOverview, catalog, csvLine, describeFilters, fullExportChunks, parseParams, pickColumns,
 } from '../services/exports.js'
@@ -33,7 +34,7 @@ const slug = (s) =>
     .replace(/^-+|-+$/g, '')
     .slice(0, 40)
 
-async function fileStem(dataset) {
+async function fileStem(dataset, siteName = '') {
   let company = ''
   try {
     const { rows } = await query(`SELECT value FROM app_settings WHERE key = 'company_name'`)
@@ -42,7 +43,8 @@ async function fileStem(dataset) {
     /* branding is cosmetic */
   }
   const day = new Date().toISOString().slice(0, 10)
-  return `${company ? `${company}_` : ''}${dataset}_${day}`
+  const site = slug(siteName)
+  return `${company ? `${company}_` : ''}${site ? `${site}_` : ''}${dataset}_${day}`
 }
 
 function setDownloadHeaders(res, filename, type) {
@@ -106,7 +108,8 @@ router.get('/full', requireAdmin, async (req, res) => {
   }
 })
 
-router.get('/:dataset', async (req, res) => {
+// every dataset except the admin-only whole-database export is limited to ONE site: the request's site
+router.get('/:dataset', requireSite, async (req, res) => {
   try {
     const dataset = DATASETS[req.params.dataset]
     if (!dataset) return res.status(404).json({ error: 'Unknown export' })
@@ -116,12 +119,12 @@ router.get('/:dataset', async (req, res) => {
     const format = String(req.query.format || 'csv').toLowerCase()
     if (!['csv', 'json'].includes(format)) return res.status(400).json({ error: 'format must be csv or json' })
 
-    const params = await parseParams(req.query)
+    const params = { ...(await parseParams(req.query)), siteId: req.siteId }
     const batches = dataset.rows(params)
     const columns = pickColumns(dataset, req.query.columns) // optional ?columns=key1,key2
     const keys = columns.map((c) => c.key)
     const wantOverview = !['0', 'false', 'no'].includes(String(req.query.overview ?? '1').toLowerCase())
-    audit(req, `${req.params.dataset} (${format})`)
+    audit(req, `${req.params.dataset} (${format}) site=${req.site?.name}`)
 
     if (format === 'json') {
       const rows = []
@@ -140,6 +143,7 @@ router.get('/:dataset', async (req, res) => {
       return res.json({
         id: req.params.dataset,
         title: dataset.title,
+        site: req.site?.name || '',
         columns,
         rows,
         truncated,
@@ -152,7 +156,7 @@ router.get('/:dataset', async (req, res) => {
 
     // CSV: UTF-8 with a byte-order mark (so Excel reads accents/₦ correctly) and CRLF line ends
     const w = makeWriter(req, res)
-    const name = `${await fileStem(req.params.dataset)}.csv`
+    const name = `${await fileStem(req.params.dataset, req.site?.name)}.csv`
     const iter = batches[Symbol.asyncIterator]()
     let next = await iter.next() // first batch before headers: query errors stay clean 500s
     setDownloadHeaders(res, name, 'text/csv; charset=utf-8')
@@ -165,7 +169,8 @@ router.get('/:dataset', async (req, res) => {
         const { rows: co } = await query(`SELECT key, value FROM app_settings WHERE key IN ('company_name', 'site_location')`)
         const set = Object.fromEntries(co.map((r) => [r.key, r.value]))
         if (set.company_name) lines.unshift(['Company', set.company_name])
-        if (set.site_location) lines.splice(set.company_name ? 1 : 0, 0, ['Site', set.site_location])
+        const siteLine = req.site?.name || set.site_location
+        if (siteLine) lines.splice(set.company_name ? 1 : 0, 0, ['Site', siteLine])
       } catch { /* branding is cosmetic */ }
       lines.push(['Generated', new Date().toISOString().replace('T', ' ').slice(0, 16) + ' UTC'])
       lines.push(['Filters applied', describeFilters(dataset, params).join(' | ')])

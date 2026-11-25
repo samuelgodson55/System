@@ -38,7 +38,8 @@ router.get('/conflicts', async (_req, res) => {
 })
 
 /** GET /api/recipients/:id/usage → which departments this person's records are filed under */
-router.get('/:id/usage', async (req, res) => {
+// ledger counts across ALL sites: admin only (staff only need the company-wide name list above)
+router.get('/:id/usage', requireAdmin, async (req, res) => {
   try {
     res.json(await recipientLedgerDepartments(req.params.id))
   } catch (e) {

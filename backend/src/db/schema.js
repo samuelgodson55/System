@@ -299,6 +299,65 @@ END $$;
 -- Recipient look-ups compare lower(btrim(recipient)); without a matching index they scan the whole ledger.
 CREATE INDEX IF NOT EXISTS idx_transactions_recipient_norm ON transactions (lower(btrim(recipient)));
 CREATE INDEX IF NOT EXISTS idx_events_start ON events (start_date);
+
+-- ---- multiple sites (stores / locations) -----------------------------------------------------------
+-- One company, several sites. Each ITEM belongs to exactly one site, so stock, kit contents, ledger lines
+-- (through their item), faults and outstanding balances are separated per site without touching any of the
+-- existing stock maths. Events belong to a site too. Staff accounts are tied to one site; admins choose.
+-- Categories, units and recipients stay company-wide. Everything here is additive and idempotent:
+-- on an existing install ALL current data lands in one default site, so nothing changes for anybody.
+CREATE TABLE IF NOT EXISTS sites (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name VARCHAR(120) NOT NULL,
+  address VARCHAR(200),
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_sites_name ON sites (lower(name));
+
+-- The default site: named after the old "Site location" branding setting when there is one.
+INSERT INTO sites (name)
+SELECT COALESCE(
+  NULLIF(left(btrim((SELECT value FROM app_settings WHERE key = 'site_location')), 120), ''),
+  'Main Site'
+)
+WHERE NOT EXISTS (SELECT 1 FROM sites);
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS site_id UUID REFERENCES sites(id) ON DELETE RESTRICT;
+ALTER TABLE items ADD COLUMN IF NOT EXISTS site_id UUID REFERENCES sites(id) ON DELETE RESTRICT;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS site_id UUID REFERENCES sites(id) ON DELETE RESTRICT;
+
+-- Backfill: everything that exists today belongs to the first (default) site. Staff are assigned to it too;
+-- admins stay unassigned (they pick the site they are working in).
+UPDATE items SET site_id = (SELECT id FROM sites ORDER BY created_at, id LIMIT 1) WHERE site_id IS NULL;
+UPDATE events SET site_id = (SELECT id FROM sites ORDER BY created_at, id LIMIT 1) WHERE site_id IS NULL;
+UPDATE users SET site_id = (SELECT id FROM sites ORDER BY created_at, id LIMIT 1) WHERE site_id IS NULL AND role = 'staff';
+
+-- A SKU is now unique PER SITE (the same product can be stocked at several sites under the same code).
+-- The new index is created before the old global constraint is dropped, inside the same transaction.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_items_site_sku ON items (site_id, sku);
+DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'items_sku_key' AND conrelid = 'items'::regclass) THEN
+    ALTER TABLE items DROP CONSTRAINT items_sku_key;
+  END IF;
+END $$;
+
+-- Every item and event must have a site (guarded: only once nothing is left without one).
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM items WHERE site_id IS NULL) THEN
+    ALTER TABLE items ALTER COLUMN site_id SET NOT NULL;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM events WHERE site_id IS NULL) THEN
+    ALTER TABLE events ALTER COLUMN site_id SET NOT NULL;
+  END IF;
+EXCEPTION WHEN others THEN NULL;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_items_site ON items (site_id);
+CREATE INDEX IF NOT EXISTS idx_items_site_name ON items (site_id, name);
+CREATE INDEX IF NOT EXISTS idx_events_site ON events (site_id);
+CREATE INDEX IF NOT EXISTS idx_users_site ON users (site_id);
 `
 
 /** Apply the schema using a pg client or pool. */

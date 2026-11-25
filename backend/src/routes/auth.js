@@ -12,7 +12,9 @@ import {
 const router = Router()
 
 // Columns every sign-in / session read needs
-const USER_COLS = 'id, username, password_hash, name, role, token_version, must_change_password, recovery_codes'
+const USER_COLS =
+  'id, username, password_hash, name, role, token_version, must_change_password, recovery_codes, site_id,' +
+  ' (SELECT s.name FROM sites s WHERE s.id = users.site_id) AS site_name'
 
 // The passwords the seed script creates. Accounts still using one are flagged so the app can nag.
 const SEED_PASSWORDS = { admin: 'admin123', staff: 'staff123' }
@@ -47,6 +49,9 @@ const publicUser = (u) => ({ id: u.id, username: u.username, name: u.name, role:
 const sessionUser = (u, extra = {}) => ({
   ...publicUser(u),
   mustChangePassword: !!u.must_change_password,
+  // staff: the one site they work in; admins have none of their own (they switch between sites)
+  siteId: u.site_id || null,
+  siteName: u.site_name || null,
   ...(u.role === 'admin' ? { recoveryCodesRemaining: countUnusedCodes(u.recovery_codes) } : {}),
   ...extra,
 })

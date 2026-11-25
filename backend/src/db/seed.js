@@ -27,11 +27,15 @@ async function seed() {
     process.exit(1)
   }
 
+  // the schema always creates a default site (see db/schema.js); the demo staff account and all demo data belong to it
+  const { rows: siteRows } = await query('SELECT id FROM sites ORDER BY created_at, id LIMIT 1')
+  const siteId = siteRows[0].id
+
   const adminHash = await bcrypt.hash(adminPassword, 10)
   await query(`INSERT INTO users (username, password_hash, name, role) VALUES ('admin', $1, 'Admin User', 'admin')`, [adminHash])
   if (demo) {
     const staffHash = await bcrypt.hash(staffPassword, 10)
-    await query(`INSERT INTO users (username, password_hash, name, role) VALUES ('staff', $1, 'Staff Member', 'staff')`, [staffHash])
+    await query(`INSERT INTO users (username, password_hash, name, role, site_id) VALUES ('staff', $1, 'Staff Member', 'staff', $2)`, [staffHash, siteId])
   }
 
   const unitsRes = await query(
@@ -54,11 +58,12 @@ async function seed() {
   const baseUnit = unitMap['pc']
 
   const eventsRes = await query(
-    `INSERT INTO events (name, description, location, start_date, end_date, status) VALUES
-     ('Annual Conference 2026', 'Company annual conference at main hall', 'Main Conference Hall', '2026-11-20', '2026-11-22', 'upcoming'),
-     ('Team Building Day', 'Outdoor team building activities', 'City Park', '2026-11-15', '2026-11-15', 'active'),
-     ('Product Launch', 'New product line launch event', 'Exhibition Center', '2026-10-10', '2026-10-12', 'completed')
-     RETURNING id, name`
+    `INSERT INTO events (name, description, location, start_date, end_date, status, site_id) VALUES
+     ('Annual Conference 2026', 'Company annual conference at main hall', 'Main Conference Hall', '2026-11-20', '2026-11-22', 'upcoming', $1),
+     ('Team Building Day', 'Outdoor team building activities', 'City Park', '2026-11-15', '2026-11-15', 'active', $1),
+     ('Product Launch', 'New product line launch event', 'Exhibition Center', '2026-10-10', '2026-10-12', 'completed', $1)
+     RETURNING id, name`,
+    [siteId]
   )
   const eventMap = Object.fromEntries(eventsRes.rows.map((e) => [e.name, e.id]))
 
@@ -82,9 +87,9 @@ async function seed() {
   const itemIds = {}
   for (const [sku, name, desc, cat, qty, reorder, loc, type, pieces, kitNotes] of itemsData) {
     const { rows } = await query(
-      `INSERT INTO items (sku, name, description, category, quantity, base_unit_id, reorder_level, location, item_type, pieces_per_set, kit_notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
-      [sku, name, desc, cat, qty, baseUnit, reorder, loc, type, pieces, kitNotes]
+      `INSERT INTO items (sku, name, description, category, quantity, base_unit_id, reorder_level, location, item_type, pieces_per_set, kit_notes, site_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
+      [sku, name, desc, cat, qty, baseUnit, reorder, loc, type, pieces, kitNotes, siteId]
     )
     itemIds[sku] = rows[0].id
   }

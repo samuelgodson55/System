@@ -1,12 +1,15 @@
 import { Router } from 'express'
 import { query } from '../db/pool.js'
 import { authenticate, requireAdmin } from '../middleware/auth.js'
+import { requireSite, siteEventParam } from '../middleware/site.js'
 import { uuidParam, isCalendarDate, cleanLine, clean } from '../middleware/validate.js'
 import { mapTxn } from '../services/mappers.js'
 
 const router = Router()
-router.use(authenticate)
+router.use(authenticate, requireSite)
 router.param('id', uuidParam)
+// an event of another site answers 404, for every role (see middleware/site.js)
+router.param('id', siteEventParam)
 
 const STATUSES = ['upcoming', 'active', 'completed']
 
@@ -44,10 +47,10 @@ function readBody(b = {}, current = null) {
   return { value: { name, description, location, status, startDate, endDate } }
 }
 
-router.get('/', async (_req, res) => {
+router.get('/', async (req, res) => {
   try {
     const { rows } = await query(`SELECT e.*, (SELECT COUNT(*) FROM transactions t WHERE t.event_id = e.id) AS txn_count
-       FROM events e ORDER BY e.start_date DESC NULLS LAST, e.name`)
+       FROM events e WHERE e.site_id = $1 ORDER BY e.start_date DESC NULLS LAST, e.name`, [req.siteId])
     res.json(rows.map(mapEvent))
   } catch (e) {
     console.error(e)
@@ -86,9 +89,9 @@ router.post('/', async (req, res) => {
     const { error, value: v } = readBody(req.body)
     if (error) return res.status(400).json({ error })
     const { rows } = await query(
-      `INSERT INTO events (name, description, location, start_date, end_date, status)
-       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-      [v.name, v.description, v.location, v.startDate, v.endDate, v.status]
+      `INSERT INTO events (name, description, location, start_date, end_date, status, site_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [v.name, v.description, v.location, v.startDate, v.endDate, v.status, req.siteId]
     )
     res.status(201).json(mapEvent(rows[0]))
   } catch (e) {

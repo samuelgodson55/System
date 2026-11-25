@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { query, withTransaction } from '../db/pool.js'
 import { authenticate, requireAdmin } from '../middleware/auth.js'
+import { requireSite, siteItemParam, assertItemsInSite, assertEventInSite } from '../middleware/site.js'
 import { uuidParam, isUuid, clean, intParam, isCalendarDate, escapeLike } from '../middleware/validate.js'
 import { mapTxn } from '../services/mappers.js'
 import {
@@ -14,9 +15,11 @@ import { bulkIssue, bulkReceive } from '../services/bulk.js'
 import { runOnce } from '../services/idempotency.js'
 
 const router = Router()
-router.use(authenticate)
+router.use(authenticate, requireSite)
 router.param('id', uuidParam)
 router.param('itemId', uuidParam)
+// an item of another site answers 404, for every role (see middleware/site.js)
+router.param('itemId', siteItemParam)
 
 router.get('/', async (req, res) => {
   try {
@@ -31,9 +34,9 @@ router.get('/', async (req, res) => {
     for (const [label, v] of [['from', from], ['to', to]]) {
       if (v && !isCalendarDate(String(v))) return res.status(400).json({ error: `"${label}" must be a date (YYYY-MM-DD)` })
     }
-    const conditions = []
-    const params = []
-    let i = 1
+    const conditions = ['t.item_id IN (SELECT id FROM items WHERE site_id = $1)']
+    const params = [req.siteId]
+    let i = 2
     if (itemId) { conditions.push(`t.item_id = $${i++}`); params.push(itemId) }
     if (eventId) { conditions.push(`t.event_id = $${i++}`); params.push(eventId) }
     if (type) { conditions.push(`t.type = $${i++}`); params.push(type) }
@@ -115,8 +118,9 @@ router.get('/daily', async (req, res) => {
        WHERE t.type = 'issue'
          AND t.created_at >= ($1::date)::timestamp AT TIME ZONE $2
          AND t.created_at <  (($1::date + 1))::timestamp AT TIME ZONE $2
+         AND i.site_id = $3
        ORDER BY t.created_at DESC, t.parent_txn_id NULLS FIRST, kc.position`,
-      [date, tz]
+      [date, tz, req.siteId]
     )
 
     res.json({
@@ -145,7 +149,7 @@ router.get('/daily', async (req, res) => {
  */
 router.get('/outstanding', async (req, res) => {
   try {
-    res.json(await listOutstanding(req.query))
+    res.json(await listOutstanding({ ...req.query, siteId: req.siteId }))
   } catch (e) {
     console.error(e)
     res.status(500).json({ error: 'Failed to fetch outstanding stock' })
@@ -307,6 +311,12 @@ function kitHandler(fn, label, { saveRecipient = false } = {}) {
       const result = await withTransaction(async (client) => {
         const b = req.body || {}
         if (!isUuid(b.itemId)) throw new HttpError(404, 'Item not found')
+        // the kit and any event it is booked against must belong to this request's site
+        await assertItemsInSite(client, req.siteId, [b.itemId], (m) => new HttpError(404, m))
+        if (b.eventId) {
+          if (!isUuid(b.eventId)) throw new HttpError(400, 'Invalid event')
+          await assertEventInSite(client, req.siteId, b.eventId, (m) => new HttpError(400, m))
+        }
         let recipient = clean(b.recipient)
         let department = clean(b.department)
         if (saveRecipient && recipient) {
@@ -359,15 +369,16 @@ router.post('/return-batch', async (req, res) => {
     if (!Array.isArray(b.itemIds) || !b.itemIds.every(isUuid)) {
       return res.status(400).json({ error: 'itemIds must be a list of valid item ids' })
     }
-    const result = await withTransaction((client) =>
-      returnEverything(client, {
+    const result = await withTransaction(async (client) => {
+      await assertItemsInSite(client, req.siteId, b.itemIds, (m) => new HttpError(404, m))
+      return returnEverything(client, {
         itemIds: b.itemIds,
         recipient: clean(b.recipient),
         department: clean(b.department),
         notes: clean(b.notes),
         performedBy: req.user?.name || 'Unknown',
       })
-    )
+    })
     res.status(201).json(result)
   } catch (e) {
     if (!(e instanceof HttpError)) console.error(e)
@@ -391,8 +402,8 @@ function bulkHandler(fn, label) {
       const { result, replayed } = await runOnce(
         req.user?.id || req.user?.username || req.user?.name || 'user',
         b.requestId,
-        JSON.stringify([b.lines, b.recipient, b.department, b.source, b.eventId, b.vendor, b.notes]),
-        () => withTransaction((client) => fn(client, { ...b, performedBy: req.user?.name || 'Unknown' }))
+        JSON.stringify([req.siteId, b.lines, b.recipient, b.department, b.source, b.eventId, b.vendor, b.notes]),
+        () => withTransaction((client) => fn(client, { ...b, siteId: req.siteId, performedBy: req.user?.name || 'Unknown' }))
       )
       res.status(replayed ? 200 : 201).json({ ...result, replayed })
     } catch (e) {
@@ -443,8 +454,8 @@ router.post('/', async (req, res) => {
       const itemRes = await client.query(
         `SELECT i.id, i.quantity, i.item_type, bu.abbreviation AS base_abbr
          FROM items i LEFT JOIN units bu ON bu.id = i.base_unit_id
-         WHERE i.id = $1 FOR UPDATE OF i`,
-        [itemId]
+         WHERE i.id = $1 AND i.site_id = $2 FOR UPDATE OF i`,
+        [itemId, req.siteId]
       )
       if (!itemRes.rows.length) {
         const err = new Error('Item not found')
@@ -452,6 +463,7 @@ router.post('/', async (req, res) => {
         throw err
       }
       const item = itemRes.rows[0]
+      if (eventId) await assertEventInSite(client, req.siteId, eventId, (m) => new HttpError(400, m))
 
       // The unit must be one that applies to this item. The server works out the base
       // quantity itself from the item's conversion factor, so a wrong or stale browser
@@ -572,8 +584,10 @@ router.delete('/:id', requireAdmin, async (req, res) => {
       const { rows } = await client.query('SELECT * FROM transactions WHERE id=$1 FOR UPDATE', [req.params.id])
       if (!rows.length) throw new HttpError(404, 'Not found')
       const t = rows[0]
-      const itemRes = await client.query('SELECT id, quantity, item_type FROM items WHERE id=$1 FOR UPDATE', [t.item_id])
+      const itemRes = await client.query('SELECT id, quantity, item_type, site_id FROM items WHERE id=$1 FOR UPDATE', [t.item_id])
       const item = itemRes.rows[0]
+      // a ledger line belongs to its item's site; one from another site does not exist as far as this request is concerned
+      if (!item || item.site_id !== req.siteId) throw new HttpError(404, 'Not found')
       if (item?.item_type === 'kit' || t.component_id || t.parent_txn_id) {
         throw new HttpError(400, 'Kit transactions cannot be deleted – record a correcting transaction instead')
       }

@@ -15,7 +15,7 @@ import bcrypt from 'bcryptjs'
 import { query, withTransaction } from '../db/pool.js'
 import { authenticate, requireAdmin } from '../middleware/auth.js'
 import { rateLimit } from '../middleware/rateLimit.js'
-import { uuidParam } from '../middleware/validate.js'
+import { uuidParam, isUuid } from '../middleware/validate.js'
 import { HttpError } from '../services/kits.js'
 import {
   USERNAME_RE, ROLES, BCRYPT_COST, passwordProblem, generateTempPassword, auditLog,
@@ -32,7 +32,21 @@ const mapUser = (r) => ({
   role: r.role,
   mustChangePassword: r.must_change_password,
   createdAt: r.created_at,
+  siteId: r.site_id || null,
+  siteName: r.site_name || null,
 })
+
+// every user read/write returns the site name too
+const USER_OUT = `id, username, name, role, must_change_password, created_at, site_id,
+  (SELECT s.name FROM sites s WHERE s.id = users.site_id) AS site_name`
+
+/** A staff account must belong to a real site. Returns the site id, or throws a 400. */
+async function resolveStaffSite(db, siteId) {
+  if (!isUuid(siteId)) throw new HttpError(400, 'Choose the site this staff member works at')
+  const { rows } = await db.query('SELECT id FROM sites WHERE id = $1', [siteId])
+  if (!rows.length) throw new HttpError(400, 'That site does not exist')
+  return rows[0].id
+}
 
 function fail(res, e, fallback) {
   if (e instanceof HttpError) return res.status(e.status).json({ error: e.message })
@@ -71,7 +85,7 @@ async function adminCountLocked(client) {
 router.get('/', async (_req, res) => {
   try {
     const { rows } = await query(
-      'SELECT id, username, name, role, must_change_password, created_at FROM users ORDER BY lower(name), username'
+      `SELECT ${USER_OUT} FROM users ORDER BY lower(name), username`
     )
     res.json(rows.map(mapUser))
   } catch (e) {
@@ -105,11 +119,13 @@ router.post('/', confirmLimiter, async (req, res) => {
     const hash = await bcrypt.hash(temporaryPassword, BCRYPT_COST)
     const { rows: taken } = await query('SELECT 1 FROM users WHERE lower(username) = lower($1)', [username])
     if (taken.length) return res.status(409).json({ error: 'That username is already taken' })
+    // staff are tied to exactly one site; admins are not (they switch between sites)
+    const siteId = role === 'staff' ? await resolveStaffSite({ query }, req.body?.siteId) : null
     const { rows } = await query(
-      `INSERT INTO users (username, password_hash, name, role, must_change_password)
-       VALUES ($1,$2,$3,$4,TRUE)
-       RETURNING id, username, name, role, must_change_password, created_at`,
-      [username, hash, name, role]
+      `INSERT INTO users (username, password_hash, name, role, must_change_password, site_id)
+       VALUES ($1,$2,$3,$4,TRUE,$5)
+       RETURNING ${USER_OUT}`,
+      [username, hash, name, role, siteId]
     )
     auditLog(req.user.username, `created ${role} account`, username)
     res.status(201).json({ user: mapUser(rows[0]), temporaryPassword })
@@ -118,13 +134,14 @@ router.post('/', confirmLimiter, async (req, res) => {
   }
 })
 
-/** PUT /api/users/:id { role?, name?, adminPassword } – change a role and/or display name. */
+/** PUT /api/users/:id { role?, name?, siteId?, adminPassword } – change a role, display name and/or (staff) site. */
 router.put('/:id', confirmLimiter, async (req, res) => {
   try {
     await confirmActingAdmin(req)
     const wantsRole = req.body?.role !== undefined
     const wantsName = req.body?.name !== undefined
-    if (!wantsRole && !wantsName) return res.status(400).json({ error: 'Nothing to change' })
+    const wantsSite = req.body?.siteId !== undefined
+    if (!wantsRole && !wantsName && !wantsSite) return res.status(400).json({ error: 'Nothing to change' })
     if (wantsRole && !ROLES.includes(req.body.role)) return res.status(400).json({ error: 'Role must be admin or staff' })
     const name = wantsName ? cleanName(req.body.name) : null
     if (wantsName && (!name || name.length > 120)) {
@@ -132,10 +149,21 @@ router.put('/:id', confirmLimiter, async (req, res) => {
     }
     const saved = await withTransaction(async (client) => {
       const admins = await adminCountLocked(client)
-      const { rows } = await client.query('SELECT id, username, role FROM users WHERE id = $1 FOR UPDATE', [req.params.id])
+      const { rows } = await client.query('SELECT id, username, role, site_id FROM users WHERE id = $1 FOR UPDATE', [req.params.id])
       const cur = rows[0]
       if (!cur) throw new HttpError(404, 'User not found')
       const roleChanges = wantsRole && req.body.role !== cur.role
+      const nextRole = roleChanges ? req.body.role : cur.role
+      // staff need a site (the one given, else the one they already have); admins have none
+      // (a plain rename of a staff account that has no site yet must still work, so a site is only
+      // demanded when the site or the role is actually being changed)
+      let nextSite = null
+      if (nextRole === 'staff') {
+        nextSite = wantsSite || roleChanges
+          ? await resolveStaffSite(client, wantsSite ? req.body.siteId : cur.site_id)
+          : cur.site_id || null
+      }
+      const siteChanges = (nextSite || null) !== (cur.site_id || null)
       if (roleChanges) {
         if (cur.id === req.user.id) {
           throw new HttpError(409, "You can't change your own role. Ask another admin to do it.")
@@ -145,14 +173,15 @@ router.put('/:id', confirmLimiter, async (req, res) => {
         }
       }
       const { rows: out } = await client.query(
-        `UPDATE users SET role = $1, name = COALESCE($2, name),
+        `UPDATE users SET role = $1, name = COALESCE($2, name), site_id = $5,
            token_version = token_version + $3::int
          WHERE id = $4
-         RETURNING id, username, name, role, must_change_password, created_at`,
-        [roleChanges ? req.body.role : cur.role, name, roleChanges ? 1 : 0, cur.id]
+         RETURNING ${USER_OUT}`,
+        [nextRole, name, roleChanges || siteChanges ? 1 : 0, cur.id, nextSite]
       )
       if (roleChanges) auditLog(req.user.username, `changed role ${cur.role} → ${req.body.role} for`, cur.username)
-      else auditLog(req.user.username, 'renamed account', cur.username)
+      if (siteChanges) auditLog(req.user.username, 'changed the site of', cur.username)
+      if (!roleChanges && !siteChanges) auditLog(req.user.username, 'renamed account', cur.username)
       return out[0]
     })
     res.json({ user: mapUser(saved) })

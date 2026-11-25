@@ -30,14 +30,14 @@ export async function authenticate(req, res, next) {
   }
   try {
     const { rows } = await query(
-      'SELECT id, username, name, role, token_version, must_change_password FROM users WHERE id = $1',
+      'SELECT id, username, name, role, token_version, must_change_password, site_id FROM users WHERE id = $1',
       [payload.id]
     )
     const u = rows[0]
     if (!u || (payload.tv ?? 0) !== u.token_version) {
       return res.status(401).json({ error: 'Invalid or expired token' })
     }
-    req.user = { id: u.id, username: u.username, name: u.name, role: u.role }
+    req.user = { id: u.id, username: u.username, name: u.name, role: u.role, siteId: u.site_id || null }
     if (u.must_change_password && !ALLOWED_WHILE_PASSWORD_CHANGE_PENDING.has(req.originalUrl.split('?')[0])) {
       return res.status(403).json({
         error: 'You must change your temporary password before continuing',

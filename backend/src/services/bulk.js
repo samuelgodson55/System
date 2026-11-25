@@ -62,16 +62,16 @@ function checkLines(lines) {
   })
 }
 
-async function lockItems(client, ids) {
+async function lockItems(client, ids, siteId) {
   const sorted = [...new Set(ids)].sort() // fixed order → no deadlocks between requests
   if (!sorted.length) return new Map()
   const { rows } = await client.query(
     `SELECT i.id, i.name, i.sku, i.quantity, i.item_type, bu.abbreviation AS base_abbr
      FROM items i LEFT JOIN units bu ON bu.id = i.base_unit_id
-     WHERE i.id = ANY($1::uuid[])
+     WHERE i.id = ANY($1::uuid[]) AND i.site_id = $2
      ORDER BY i.id
      FOR UPDATE OF i`,
-    [sorted]
+    [sorted, siteId]
   )
   return new Map(rows.map((r) => [r.id, { ...r, stock: Number(r.quantity) }]))
 }
@@ -105,7 +105,7 @@ async function bulkRun(client, p) {
     recipient = r.name
     department = r.department
     if (eventId) {
-      const ev = await client.query('SELECT 1 FROM events WHERE id = $1', [eventId])
+      const ev = await client.query('SELECT 1 FROM events WHERE id = $1 AND site_id = $2', [eventId, p.siteId])
       if (!ev.rows.length) throw new HttpError(400, 'That event no longer exists')
     }
   } else {
@@ -114,7 +114,7 @@ async function bulkRun(client, p) {
     if (vendor && vendor.length > 200) throw new HttpError(400, 'Vendor name must be 200 characters or fewer')
   }
 
-  const items = await lockItems(client, parsed.filter((l) => !l.error).map((l) => l.itemId))
+  const items = await lockItems(client, parsed.filter((l) => !l.error).map((l) => l.itemId), p.siteId)
   const kitCache = new Map()
 
   // 1) check every line against the locked rows

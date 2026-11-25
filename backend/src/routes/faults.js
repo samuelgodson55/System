@@ -16,10 +16,25 @@ import { Router } from 'express'
 import { query } from '../db/pool.js'
 import { authenticate, requireAdmin } from '../middleware/auth.js'
 import { uuidParam, isUuid, clean } from '../middleware/validate.js'
+import { requireSite } from '../middleware/site.js'
 
 const router = Router()
-router.use(authenticate)
+router.use(authenticate, requireSite)
 router.param('id', uuidParam)
+// a fault belongs to its item's site; one of another site answers 404 for every role
+router.param('id', async (req, res, next, value) => {
+  try {
+    const { rows } = await query(
+      'SELECT 1 FROM item_faults f JOIN items i ON i.id = f.item_id WHERE f.id = $1 AND i.site_id = $2',
+      [value, req.siteId]
+    )
+    if (!rows.length) return res.status(404).json({ error: 'Fault not found' })
+    next()
+  } catch (e) {
+    console.error(e)
+    res.status(500).json({ error: 'Failed to load fault' })
+  }
+})
 
 const USABILITY = ['usable', 'unusable']
 const RESOLUTIONS = ['repaired', 'replaced', 'written_off', 'no_fault']
@@ -87,14 +102,16 @@ async function fetchOne(id) {
   return rows[0] ? map(rows[0]) : null
 }
 
-router.get('/summary', async (_req, res) => {
+router.get('/summary', async (req, res) => {
   try {
     const { rows } = await query(
-      `SELECT item_id, COUNT(*) AS open,
-              COUNT(*) FILTER (WHERE usability = 'usable') AS usable,
-              COUNT(*) FILTER (WHERE usability = 'unusable') AS unusable,
-              COALESCE(SUM(quantity_affected) FILTER (WHERE usability = 'unusable' AND component_id IS NULL), 0) AS unusable_qty
-       FROM item_faults WHERE status = 'open' GROUP BY item_id`
+      `SELECT f.item_id, COUNT(*) AS open,
+              COUNT(*) FILTER (WHERE f.usability = 'usable') AS usable,
+              COUNT(*) FILTER (WHERE f.usability = 'unusable') AS unusable,
+              COALESCE(SUM(f.quantity_affected) FILTER (WHERE f.usability = 'unusable' AND f.component_id IS NULL), 0) AS unusable_qty
+       FROM item_faults f JOIN items i ON i.id = f.item_id
+       WHERE f.status = 'open' AND i.site_id = $1 GROUP BY f.item_id`,
+      [req.siteId]
     )
     const byItem = {}
     let open = 0, usable = 0, unusable = 0
@@ -117,8 +134,8 @@ router.get('/', async (req, res) => {
     const usability = String(req.query.usability || '')
     if (!['open', 'resolved', 'all'].includes(status)) return bad(res, 'Unknown status')
     if (usability && !USABILITY.includes(usability)) return bad(res, 'Unknown usability')
-    const where = []
-    const args = []
+    const where = ['i.site_id = $1']
+    const args = [req.siteId]
     if (status !== 'all') { args.push(status); where.push(`f.status = $${args.length}`) }
     if (usability) { args.push(usability); where.push(`f.usability = $${args.length}`) }
     if (req.query.itemId) {
@@ -144,11 +161,12 @@ router.get('/', async (req, res) => {
       [...args, lim, (page - 1) * lim]
     )
     const c = (await query(
-      `SELECT COUNT(*) FILTER (WHERE status = 'open') AS open,
-              COUNT(*) FILTER (WHERE status = 'open' AND usability = 'usable') AS usable,
-              COUNT(*) FILTER (WHERE status = 'open' AND usability = 'unusable') AS unusable,
-              COUNT(*) FILTER (WHERE status = 'resolved') AS resolved
-       FROM item_faults`
+      `SELECT COUNT(*) FILTER (WHERE f.status = 'open') AS open,
+              COUNT(*) FILTER (WHERE f.status = 'open' AND f.usability = 'usable') AS usable,
+              COUNT(*) FILTER (WHERE f.status = 'open' AND f.usability = 'unusable') AS unusable,
+              COUNT(*) FILTER (WHERE f.status = 'resolved') AS resolved
+       FROM item_faults f JOIN items i ON i.id = f.item_id WHERE i.site_id = $1`,
+      [req.siteId]
     )).rows[0]
     res.json({
       faults: rows.map(map), total, page, limit: lim,
@@ -163,7 +181,7 @@ router.get('/', async (req, res) => {
 router.post('/', async (req, res) => {
   try {
     if (!isUuid(req.body?.itemId)) return bad(res, 'Choose an item')
-    const item = await query('SELECT id FROM items WHERE id = $1', [req.body.itemId])
+    const item = await query('SELECT id FROM items WHERE id = $1 AND site_id = $2', [req.body.itemId, req.siteId])
     if (!item.rows.length) return res.status(404).json({ error: 'Item not found' })
     const { error, value: v } = await readBody(req.body, req.body.itemId)
     if (error) return bad(res, error)

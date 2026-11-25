@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { query, withTransaction } from '../db/pool.js'
 import { authenticate, requireAdmin } from '../middleware/auth.js'
+import { requireSite, siteItemParam } from '../middleware/site.js'
 import { uuidParam, isUuid, intParam, escapeLike } from '../middleware/validate.js'
 import { syncComponents, repackKit, repackableSets, setTotalSets, ownedSetsFrom, HttpError } from '../services/kits.js'
 import { syncItemUnits, tidyQty, QTY_EPSILON, roundQty, snapToGrid, stockGrid } from '../services/itemUnits.js'
@@ -9,8 +10,10 @@ import { ensureCategory, syncCategoriesFromItems, listCategories } from '../serv
 const ITEM_TYPES = ['consumable', 'reusable', 'kit']
 
 const router = Router()
-router.use(authenticate)
+router.use(authenticate, requireSite)
 router.param('id', uuidParam)
+// an item of another site answers 404, for every role (see middleware/site.js)
+router.param('id', siteItemParam)
 
 function mapComponent(kit, c) {
   const perKit = c.quantity_per_kit
@@ -169,9 +172,9 @@ function sendError(res, e, fallback) {
 router.get('/', async (req, res) => {
   try {
     const { search, category, itemType, lowStock } = req.query
-    const conditions = []
-    const params = []
-    let i = 1
+    const conditions = ['i.site_id = $1']
+    const params = [req.siteId]
+    let i = 2
     if (typeof search === 'string' && search.trim()) {
       // `%` and `_` typed by a person are matched literally (they used to act as wildcards)
       conditions.push(`(i.name ILIKE $${i} OR i.sku ILIKE $${i} OR i.category ILIKE $${i} OR i.location ILIKE $${i}
@@ -212,16 +215,17 @@ router.get('/', async (req, res) => {
 })
 
 /** Dashboard numbers, computed in SQL so the browser never needs the whole ledger. */
-router.get('/stats', async (_req, res) => {
+router.get('/stats', async (req, res) => {
   try {
     const [itemsRes, txnRes] = await Promise.all([
       query(`SELECT COUNT(*) AS total, COALESCE(SUM(quantity), 0) AS stock,
                     COUNT(*) FILTER (WHERE quantity <= reorder_level) AS low
-             FROM items`),
+             FROM items WHERE site_id = $1`, [req.siteId]),
       query(`SELECT COUNT(*) FILTER (WHERE parent_txn_id IS NULL) AS total,
                     COUNT(*) FILTER (WHERE parent_txn_id IS NULL AND type = 'receive') AS receives,
                     COUNT(*) FILTER (WHERE parent_txn_id IS NULL AND type = 'issue') AS issues
-             FROM transactions`),
+             FROM transactions
+             WHERE item_id IN (SELECT id FROM items WHERE site_id = $1)`, [req.siteId]),
     ])
     const i = itemsRes.rows[0]
     const t = txnRes.rows[0]
@@ -259,21 +263,21 @@ router.get('/categories', async (_req, res) => {
  * letters of the category. Runs inside the create transaction under an advisory lock so
  * two simultaneous creates cannot be handed the same number.
  */
-async function generateSku(db, category) {
+async function generateSku(db, category, siteId) {
   await db.query("SELECT pg_advisory_xact_lock(hashtext('items_sku_generate'))")
   let prefix
   const { rows } = await db.query(
     `SELECT substring(sku from '^(.*)-[0-9]+$') AS p, COUNT(*) AS n
-     FROM items WHERE lower(btrim(category)) = lower($1) AND sku ~ '^.+-[0-9]+$'
+     FROM items WHERE site_id = $2 AND lower(btrim(category)) = lower($1) AND sku ~ '^.+-[0-9]+$'
      GROUP BY p ORDER BY n DESC LIMIT 1`,
-    [category]
+    [category, siteId]
   )
   prefix = rows[0]?.p
   if (!prefix) {
     prefix = String(category).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 3).padEnd(3, 'X') || 'ITM'
   }
   const like = `${prefix.replace(/[\\%_]/g, (m) => '\\' + m)}-%`
-  const { rows: taken } = await db.query('SELECT sku FROM items WHERE sku ILIKE $1', [like])
+  const { rows: taken } = await db.query('SELECT sku FROM items WHERE site_id = $2 AND sku ILIKE $1', [like, siteId])
   let n = 1
   for (const { sku } of taken) {
     const m = /-(\d+)$/.exec(sku)
@@ -284,7 +288,7 @@ async function generateSku(db, category) {
   // the number could still collide with a differently-formatted SKU; skip ahead until free
   for (;;) {
     const sku = `${prefix}-${String(n).padStart(3, '0')}`
-    const { rowCount } = await db.query('SELECT 1 FROM items WHERE lower(sku) = lower($1)', [sku])
+    const { rowCount } = await db.query('SELECT 1 FROM items WHERE site_id = $2 AND lower(sku) = lower($1)', [sku, siteId])
     if (!rowCount) return sku
     n++
   }
@@ -338,14 +342,14 @@ router.post('/', async (req, res) => {
     const type = itemType || 'consumable'
     const id = await withTransaction(async (client) => {
       const cat = await ensureCategory(client, category)
-      const sku = String(skuInput || '').trim() || (await generateSku(client, cat))
+      const sku = String(skuInput || '').trim() || (await generateSku(client, cat, req.siteId))
       const { rows } = await client.query(
-        `INSERT INTO items (sku, name, description, category, quantity, base_unit_id, reorder_level, location, item_type, pieces_per_set, kit_notes)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
+        `INSERT INTO items (sku, name, description, category, quantity, base_unit_id, reorder_level, location, item_type, pieces_per_set, kit_notes, site_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
         [
           sku, name.trim(), description || '', cat, quantity || 0, baseUnitId,
           reorderLevel || 0, location || '', type,
-          piecesPerSet || null, kitNotes || null,
+          piecesPerSet || null, kitNotes || null, req.siteId,
         ]
       )
       await syncItemUnits(client, rows[0].id, baseUnitId, unitIds, unitFactors, unitsPerBase)

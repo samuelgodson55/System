@@ -23,7 +23,9 @@ const num = (v, fallback, min, max) => {
   return Number.isFinite(n) ? Math.min(max, Math.max(min, Math.trunc(n))) : fallback
 }
 
-export async function listOutstanding({ search, type, days, groupBy, department, page, limit }) {
+export async function listOutstanding({ search, type, days, groupBy, department, page, limit, siteId }) {
+  // balances are always per site (an item belongs to one site); never list across sites by accident
+  if (!siteId) throw new Error('listOutstanding needs a siteId')
   const types = TYPE_SETS[type] || TYPE_SETS.expected
   const windowDays = num(days, 30, 1, 365)
 
@@ -38,14 +40,14 @@ export async function listOutstanding({ search, type, days, groupBy, department,
        JOIN items i ON i.id = t.item_id
        LEFT JOIN units bu ON bu.id = i.base_unit_id
        WHERE t.component_id IS NULL AND t.recipient IS NOT NULL AND t.recipient <> ''
-         AND i.item_type = ANY($1)
+         AND i.item_type = ANY($1) AND i.site_id = $3
        GROUP BY t.item_id, t.recipient, COALESCE(t.department, ''),
                 i.name, i.sku, i.item_type, bu.abbreviation
        HAVING SUM(CASE WHEN t.type = 'issue' THEN t.quantity ELSE 0 END)
             - SUM(CASE WHEN t.type = 'return' THEN t.quantity ELSE 0 END) > 0.000001
           AND (i.item_type <> 'consumable'
                OR MAX(t.created_at) FILTER (WHERE t.type = 'issue') >= NOW() - make_interval(days => $2::int))`,
-      [types, windowDays]
+      [types, windowDays, siteId]
     ),
     // pieces of kits that are out (also covers people who only borrowed a single piece)
     types.includes('kit')
@@ -60,10 +62,12 @@ export async function listOutstanding({ search, type, days, groupBy, department,
            JOIN items i ON i.id = t.item_id
            JOIN kit_components kc ON kc.id = t.component_id
            WHERE t.component_id IS NOT NULL AND t.recipient IS NOT NULL AND t.recipient <> ''
+             AND i.site_id = $1
            GROUP BY t.item_id, t.recipient, COALESCE(t.department, ''), i.name, i.sku, i.item_type,
                     kc.id, kc.name, kc.quantity_per_kit, kc.position
            HAVING SUM(CASE WHEN t.type = 'issue' THEN t.quantity ELSE 0 END)
-                - SUM(CASE WHEN t.type = 'return' THEN t.quantity ELSE 0 END) > 0`
+                - SUM(CASE WHEN t.type = 'return' THEN t.quantity ELSE 0 END) > 0`,
+          [siteId]
         )
       : Promise.resolve({ rows: [] }),
   ])
