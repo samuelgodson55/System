@@ -56,8 +56,9 @@ for the steps and the free-plan limits (sleep after 15 min idle, free database e
 |---|---|---|
 | Add items; issue, receive, return stock; repack kits; record faults; reports & exports; add events | ✅ | ✅ |
 | Edit / delete items, edit / delete events, rename / delete categories, edit recipients, manage units, delete records | ❌ | ✅ |
-| Users (create, change role, reset password, remove), backups, settings, full export | ❌ | ✅ |
+| Users (create, change role, assign site, reset password, remove), sites, backups, settings, full export | ❌ | ✅ |
 
+- **Sites:** staff are tied to **one site** and can only see and work with that site's stock, events and reports; admins can switch between all sites (see *Multiple sites* below).
 - **Server-enforced:** these rules live in the API (`403 Admin access required`), the screens just hide what a user can't do. The role is read from the database on every request, so a demotion takes effect immediately.
 - **Users page (admin):** create accounts (random temporary password shown once, changed at first sign-in), change roles, reset another account's password (signs that person out everywhere), remove accounts. Every change re-asks for your own password. You can't change your own role or remove yourself, and the last admin can't be demoted or removed.
 - **Forgot the admin password?** On the sign-in page choose *Forgot your password?* and enter the username, one unused **recovery code** and a new password. Codes are created in *My profile → Account recovery codes* (10 per set, shown once, stored only as hashes, each works once, a new set replaces the old one). Staff who forget their password ask an admin to reset it.
@@ -172,6 +173,9 @@ inventory-system/
 | GET/POST | `/api/users` | Admin: list / create `{ username, name, role, password?, adminPassword }` (random temporary password returned once when none is given) |
 | PUT/DELETE | `/api/users/:id` | Admin: change `{ role?, name? }` / remove. Both need `adminPassword` |
 | POST | `/api/users/:id/reset-password` | Admin: `{ adminPassword, newPassword? }` → `{ temporaryPassword }`; the person must change it at next sign-in |
+| GET/POST | `/api/sites` | Admin: list (with counts) / create `{ name, address?, copyCatalogueFrom? }`. Staff get only their own site on `GET` |
+| PUT/DELETE | `/api/sites/:id` | Admin: `{ name?, address?, isActive? }` / delete (only an empty site) |
+| GET | `/api/sites/overview` | Admin: headline numbers per site |
 | GET | `/api/settings/branding` | company name + site location (public) |
 | PUT | `/api/settings/branding` | admin only |
 | GET/POST/PUT/DELETE | `/api/items` | CRUD inventory. Each item includes `quantity` (available), `outstanding` (issued, not yet returned; reusable/kit only), `totalQuantity` (available + outstanding) and `unitIds` (units enabled for the item; the base unit is always included). `POST`/`PUT` accept `unitIds`; omit it on `PUT` to leave the selection unchanged |
@@ -200,6 +204,18 @@ inventory-system/
 | GET/DELETE | `/api/backups/:filename` | Download / delete (admin) |
 | POST | `/api/backups/upload` | Upload a `.sql` backup (raw body, `X-Filename` header) (admin) |
 | POST | `/api/backups/:filename/restore` | Restore (admin) |
+
+## Multiple sites
+
+One platform, several stores. Each site has its own stock, events, issues, returns and faults; categories, units and the
+recipients list are shared.
+
+- **Admin:** *Sites* page to add / rename / deactivate sites; a switcher in the header to work in any site; a per-site
+  summary on the Dashboard. Add a site "starting from" another one to copy its item list at zero stock.
+- **Staff:** assigned to one site (set on the Users page) and locked to it, enforced by the API.
+- **Existing data** is placed in one default site by the automatic migration; nothing else changes until a second site exists.
+- Send `X-Site-Id: <site id>` as an admin to pick the site per request (no header = default site). Staff cannot change theirs.
+- A SKU is unique per site. A deactivated site is read-only. Details: `CHANGELOG-multi-site.md`.
 
 ## Units per item
 
