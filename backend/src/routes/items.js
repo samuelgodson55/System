@@ -411,7 +411,10 @@ router.put('/:id', requireAdmin, async (req, res) => {
            ) per_recipient`,
           [req.params.id]
         )
-        const outstanding = tidyQty(out.rows[0].outstanding || 0)
+        // Consumables are used up, not expected back, so nothing is ever "out" for them (the same
+        // rule ITEM_SELECT uses for display). Their total IS the in-store figure. Subtracting past
+        // issues here made the saved quantity differ from the number typed in.
+        const outstanding = itemType === 'consumable' ? 0 : tidyQty(out.rows[0].outstanding || 0)
         if (total + QTY_EPSILON < outstanding) {
           throw new HttpError(
             409,
