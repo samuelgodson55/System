@@ -6,6 +6,7 @@ import { formatDateTime } from '../utils/format'
 import { txnItemLabel } from '../utils/kits'
 import SearchBar from './SearchBar'
 import Pagination from './Pagination'
+import ServerExportButtons from './ServerExportButtons'
 import EmptyState from './EmptyState'
 
 const PAGE_SIZE = 8
@@ -91,6 +92,17 @@ export default function ReceiptHistory({ itemId = null, refreshKey = 0, onReceiv
           <RotateCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
         </button>
       </div>
+
+      {/* Export exactly what this list shows: the same item or search, optionally limited to a date range. */}
+      <ServerExportButtons
+        className="mb-3"
+        dataset="receipts"
+        title={itemId && itemName ? `Receipt history – ${itemName}` : 'Receipt history'}
+        params={itemId ? { itemId } : debounced ? { search: debounced } : {}}
+        withRange
+        rangeLabel="Received between"
+        disabled={!loading && data.total === 0}
+      />
 
       {itemId && (
         <div className="mb-3 inline-flex max-w-full items-center gap-2 rounded-full border border-primary-200 bg-primary-50 py-1 pl-3 pr-1.5 text-xs font-medium text-primary-700">
