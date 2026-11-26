@@ -410,6 +410,93 @@ async function* ledgerRows(p) {
   }
 }
 
+/**
+ * Stock receipts (type = 'receive') for the "Receipt history" export.
+ * Mirrors what the Receive Stock page lists: top-level receipts only (a kit's piece lines are part of
+ * their parent), limited to this site, with the same free-text search as that page.
+ */
+function receiptFilter(p) {
+  const { args, where } = ledgerFilter({ ...p, type: 'receive', topLevel: true })
+  const term = String(p.search || '').trim().slice(0, 100)
+  if (term) {
+    args.push(`%${term.replace(/[\\%_]/g, '\\$&')}%`) // % _ \ match literally
+    const n = `$${args.length}`
+    where.push(
+      `(EXISTS (SELECT 1 FROM items si WHERE si.id = t.item_id AND (si.name ILIKE ${n} OR si.sku ILIKE ${n}))
+        OR EXISTS (SELECT 1 FROM kit_components sk WHERE sk.id = t.component_id AND sk.name ILIKE ${n})
+        OR t.vendor ILIKE ${n} OR t.recipient ILIKE ${n} OR t.notes ILIKE ${n} OR t.performed_by ILIKE ${n})`
+    )
+  }
+  return { args, where }
+}
+
+async function* receiptRows(p) {
+  const { args, where } = receiptFilter(p)
+  let cursor = null
+  for (;;) {
+    const a = [...args]
+    const w = [...where]
+    if (cursor) {
+      a.push(cursor.created, cursor.id)
+      w.push(`(t.created_at, t.id) < ($${a.length - 1}::timestamptz, $${a.length}::uuid)`)
+    }
+    a.push(BATCH)
+    const { rows } = await query(
+      `${LEDGER_SELECT} WHERE ${w.join(' AND ')}
+       ORDER BY t.created_at DESC, t.id DESC LIMIT $${a.length}`,
+      a
+    )
+    if (!rows.length) return
+    yield rows.map((r) => {
+      const kit = r.item_type === 'kit'
+      return {
+        date: r.d,
+        time: r.tm,
+        sku: r.sku,
+        item: r.item,
+        line: r.component_id ? 'Kit piece' : kit ? 'Whole kit' : 'Item',
+        piece: text(r.piece),
+        qty: kit ? num(r.quantity) : num(r.unit_quantity),
+        unit: kit ? (r.component_id ? 'pcs' : 'sets') : text(r.unit),
+        source: r.source === 'head_office' ? 'Head Office' : 'Vendor',
+        vendor: text(r.vendor),
+        by: text(r.performed_by),
+        notes: text(r.notes),
+        id: r.id,
+      }
+    })
+    if (rows.length < BATCH) return
+    const last = rows[rows.length - 1]
+    cursor = { created: last.created_raw, id: last.id }
+  }
+}
+
+/** Receipts stream, so (like the ledger) their overview is one aggregate query. */
+async function receiptsOverview(p) {
+  const { args, where } = receiptFilter(p)
+  const { rows } = await query(
+    `SELECT COUNT(*) AS total,
+            COUNT(DISTINCT t.item_id) AS items,
+            COUNT(*) FILTER (WHERE t.source = 'head_office') AS head_office,
+            COUNT(*) FILTER (WHERE t.source IS DISTINCT FROM 'head_office') AS vendors,
+            COUNT(DISTINCT NULLIF(btrim(t.vendor), '')) AS vendor_names,
+            to_char(MIN(t.created_at) AT TIME ZONE $1, 'YYYY-MM-DD') AS first_day,
+            to_char(MAX(t.created_at) AT TIME ZONE $1, 'YYYY-MM-DD') AS last_day
+     FROM transactions t WHERE ${where.join(' AND ')}`,
+    args
+  )
+  const r = rows[0] || {}
+  return [
+    stat('Receipts', Number(r.total || 0)),
+    stat('Different items', Number(r.items || 0)),
+    stat('From head office', Number(r.head_office || 0)),
+    stat('From vendors', Number(r.vendors || 0)),
+    stat('Different vendors', Number(r.vendor_names || 0)),
+    r.first_day ? stat('First receipt', r.first_day) : null,
+    r.last_day ? stat('Latest receipt', r.last_day) : null,
+  ].filter(Boolean)
+}
+
 async function* faultRows(p) {
   const args = [p.tz]
   const where = []
@@ -576,6 +663,7 @@ async function ledgerOverview(p) {
 export async function buildOverview(id, params, rows) {
   try {
     if (id === 'transactions') return await ledgerOverview(params)
+    if (id === 'receipts') return await receiptsOverview(params)
     const fn = OVERVIEWS[id]
     return fn && rows ? fn(rows) : []
   } catch (e) {
@@ -669,6 +757,21 @@ export const DATASETS = {
       'event', 'vendor', 'recipient', 'department', 'by', 'notes',
     ],
     rows: ledgerRows,
+    streams: true,
+  },
+  receipts: {
+    title: 'Receipt history',
+    description: 'Every stock receipt (from head office or a vendor), newest first. Filter by date, item or search.',
+    group: 'Movements',
+    filters: ['range', 'search'],
+    columns: [
+      col('date', 'Date'), col('time', 'Time'), col('sku', 'SKU'), col('item', 'Item'),
+      col('line', 'Line'), col('piece', 'Kit Piece'), col('qty', 'Quantity'), col('unit', 'Unit'),
+      col('source', 'Received From'), col('vendor', 'Vendor'), col('by', 'Recorded By'),
+      col('notes', 'Notes'), col('id', 'Transaction ID'),
+    ],
+    pdfDefault: ['date', 'time', 'sku', 'item', 'line', 'piece', 'qty', 'unit', 'source', 'vendor', 'by', 'notes'],
+    rows: receiptRows,
     streams: true,
   },
   events: {
